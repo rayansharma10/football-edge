@@ -5,8 +5,15 @@ import pandas as pd
 import pytest
 
 from fedge.backtest import stats as S
+from fedge.backtest import walkforward as W
 from fedge.backtest.walkforward import matchweek_folds
 from fedge.market import devig
+
+# Results are only usable as a training row ~3h after kickoff (AGENTS.md rule 3, EMBARGO).
+# Kept as an independent floor here so a mutated default cannot make these tests agree with it.
+EMBARGO_FLOOR = pd.Timedelta(hours=3)
+# Monday 2024-09-02 00:30 UTC: first kickoff of the test block (W-SUN weeks start on Monday).
+TEST_START = pd.Timestamp("2024-09-02 00:30", tz="UTC")
 
 
 def test_matchweek_folds_no_overlap_and_chronological():
@@ -19,6 +26,72 @@ def test_matchweek_folds_no_overlap_and_chronological():
         assert ko[f.train_idx].max() < ko[f.test_idx].min()
         assert not (seen & set(f.test_idx))
         seen |= set(f.test_idx)
+
+
+def _embargo_frame() -> pd.DataFrame:
+    """Hourly history plus three matches planted around ``TEST_START``.
+
+    The planted rows land in the previous (Sunday) matchweek, so they can only ever be training
+    rows: 1h before TEST_START and exactly ``EMBARGO_FLOOR`` before it are inside the embargo
+    window, 1h earlier still is legal.
+    """
+    hist = pd.date_range(end=TEST_START - pd.Timedelta(days=20), periods=400, freq="h", tz="UTC")
+    ko = pd.DatetimeIndex(
+        [
+            *hist,
+            TEST_START - pd.Timedelta(hours=1),
+            TEST_START - EMBARGO_FLOOR,
+            TEST_START - EMBARGO_FLOOR - pd.Timedelta(hours=1),
+            TEST_START,
+            TEST_START + pd.Timedelta(hours=2),
+        ]
+    )
+    m = pd.DataFrame({"kickoff_utc": ko, "season": ["2023/24"] * (len(ko) - 2) + ["2024/25"] * 2})
+    m["match_id"] = [f"m{i}" for i in range(len(m))]
+    return m.sort_values("kickoff_utc", kind="mergesort").reset_index(drop=True)
+
+
+def _embargo_folds(m: pd.DataFrame) -> dict[str, list]:
+    return {
+        "season": list(W.season_folds(m, min_train_seasons=1)),
+        "matchweek": list(W.matchweek_folds(m, min_train_matches=100)),
+    }
+
+
+def test_default_embargo_is_not_below_the_floor():
+    """The 3h embargo is the only guard keeping same-day results out of train; keep it >= 3h."""
+    assert W.EMBARGO >= EMBARGO_FLOOR
+
+
+def test_every_fold_respects_the_embargo_and_never_overlaps():
+    m = _embargo_frame()
+    ko = m.kickoff_utc
+    for kind, folds in _embargo_folds(m).items():
+        assert folds, kind
+        for f in folds:
+            train_max = ko.iloc[f.train_idx].max()
+            assert not (set(f.train_idx) & set(f.test_idx)), (kind, f.label)
+            assert train_max <= f.test_start - W.EMBARGO, (kind, f.label)
+            # independent of the live constant: no training row within 3h of the test block
+            assert train_max <= f.test_start - EMBARGO_FLOOR, (kind, f.label, train_max)
+
+
+def test_matches_inside_the_embargo_window_are_not_training_rows():
+    """Planted case: a match 1h before the test block (and one exactly EMBARGO before it, the
+    comparison is strict) must not be a training row; 1h earlier must be."""
+    m = _embargo_frame()
+    ko = m.kickoff_utc
+    inside = m.index[ko == TEST_START - pd.Timedelta(hours=1)]
+    boundary = m.index[ko == TEST_START - EMBARGO_FLOOR]
+    legal = m.index[ko == TEST_START - EMBARGO_FLOOR - pd.Timedelta(hours=1)]
+    assert len(inside) == len(boundary) == len(legal) == 1
+    for kind, folds in _embargo_folds(m).items():
+        matches = [f for f in folds if f.test_start == TEST_START]
+        assert len(matches) == 1, kind
+        train = set(matches[0].train_idx)
+        assert not (train & set(inside)), f"{kind}: match 1h before test_start used as training"
+        assert not (train & set(boundary)), f"{kind}: exactly {EMBARGO_FLOOR} before is unusable"
+        assert train & set(legal), f"{kind}: {ko[legal[0]]} must be usable as training"
 
 
 def test_clv_zero_at_fair_close_and_overround_at_raw_close():

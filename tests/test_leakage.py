@@ -11,7 +11,13 @@ import pytest
 from sklearn.linear_model import LogisticRegression
 
 from fedge.backtest.walkforward import run_walkforward, season_folds
-from fedge.features.asof import LeakageError, asof, assert_no_leak, build_features
+from fedge.features.asof import (
+    OUTCOME_COLS,
+    LeakageError,
+    asof,
+    assert_no_leak,
+    build_features,
+)
 
 N_TEAMS = 16
 SEASONS = ["2020/21", "2021/22", "2022/23", "2023/24"]
@@ -179,3 +185,89 @@ def test_walkforward_folds_are_chronological(world):
         tr, te = df.iloc[f.train_idx], df.iloc[f.test_idx]
         assert tr.kickoff_utc.max() < te.kickoff_utc.min()
         assert set(tr.season).isdisjoint(set(te.season))
+
+
+def test_build_features_never_hands_the_target_to_fn(world):
+    """M1: the bet row carries FTHG/FTAG/FTR, so the gateway must strip them before calling fn."""
+    table = results_table(world)
+    bets = world.assign(bet_time=world.kickoff_utc - pd.Timedelta(hours=1))
+    seen = {}
+
+    def spy(visible, bet):
+        seen["cols"] = list(bet.index)
+        return {"x": 0.0}
+
+    build_features(table, bets.iloc[:5], spy)
+    assert set(seen["cols"]) == set(bets.columns) - set(OUTCOME_COLS)
+    assert {"home", "away", "kickoff_utc", "bet_time", "match_id"} <= set(seen["cols"])
+
+    def cheat(visible, bet):
+        return {"x": float(bet["FTHG"])}  # read the result of the match being bet on
+
+    with pytest.raises(LeakageError, match="FTHG"):
+        build_features(table, bets.iloc[:5], cheat)
+
+
+def test_build_features_output_is_invariant_to_permuting_the_target(world):
+    """M1: a gateway that exposes the target lets a feature read it, so feature output then moves
+    when the targets are permuted. Pairs with test_b_shuffled_targets_collapse_edge, which only
+    fires at >=0.05*goal-difference."""
+    table = results_table(world)
+    bets = world.assign(bet_time=world.kickoff_utc - pd.Timedelta(hours=1))
+    bets["FTR"] = np.where(bets.FTHG > bets.FTAG, "H", np.where(bets.FTHG == bets.FTAG, "D", "A"))
+
+    def opportunistic(visible, bet):
+        # would use the result of its own match whenever the gateway exposes it
+        return {"x": float(bet["FTHG"]) if "FTHG" in bet.index else 0.0}
+
+    base = build_features(table, bets, opportunistic)
+    perm = np.random.default_rng(11).permutation(len(bets))
+    shuf = bets.copy()
+    shuf[["FTHG", "FTAG", "FTR"]] = bets[["FTHG", "FTAG", "FTR"]].to_numpy()[perm]
+    assert (shuf.FTHG.to_numpy() != bets.FTHG.to_numpy()).any()  # the shuffle really moves them
+    pd.testing.assert_frame_equal(base, build_features(table, shuf, opportunistic))
+
+
+def test_build_features_visible_rows_equal_asof_row_for_row(world):
+    """Pins the window contract: fn gets exactly asof()'s rows in asof()'s order, even when the
+    feature table is not time-ordered (guards any future change to how the window is selected)."""
+    table = results_table(world).sample(frac=1.0, random_state=3).reset_index(drop=True)
+    bets = world.assign(bet_time=world.kickoff_utc - pd.Timedelta(hours=1)).iloc[::37]
+
+    def probe(visible, bet):
+        return {
+            "n": len(visible),
+            "gd_sum": float(visible.gd.sum()),
+            "first_team": str(visible.team.iloc[0]) if len(visible) else "",
+        }
+
+    fast = build_features(table, bets, probe)
+    ref = pd.DataFrame([probe(asof(table, t), None) for t in bets.bet_time], index=bets.index)
+    pd.testing.assert_frame_equal(fast, ref)
+
+
+def test_build_features_accepts_bet_times_at_another_timestamp_resolution(world):
+    """pandas 3 units: a us-resolution table and ns-resolution bet times must still compare, so a
+    bet time is never silently assumed to share the feature table's resolution."""
+    table = results_table(world)
+    bets = world.assign(bet_time=world.kickoff_utc - pd.Timedelta(hours=1))
+    coarse = table.astype({"available_at": "datetime64[us, UTC]"})
+    bets["bet_time"] = pd.DatetimeIndex(bets["bet_time"]).as_unit("ns")
+    assert coarse.available_at.dtype != bets.bet_time.dtype
+
+    def probe(visible, bet):
+        return {"n": len(visible), "gd_sum": float(visible.gd.sum())}
+
+    pd.testing.assert_frame_equal(
+        build_features(coarse, bets, probe), build_features(table, bets, probe)
+    )
+
+
+def test_run_walkforward_rejects_folds_built_from_another_frame(world):
+    """m1: fold indices are positional, so a reordered frame must be refused, not silently used."""
+    df = featurise(world, results_table(world))
+    folds = list(season_folds(df))
+    shuffled = df.sample(frac=1.0, random_state=5).reset_index(drop=True)
+    with pytest.raises(ValueError, match="different frame"):
+        run_walkforward(shuffled, folds[:1], fit_predict)
+    assert len(run_walkforward(df, folds[:1], fit_predict)) == len(df.iloc[folds[0].test_idx])
