@@ -30,7 +30,10 @@ import sqlite3
 from collections.abc import Iterable
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+
+from fedge.backtest.stats import net_odds
 
 BET_COLUMNS = (
     "bet_id",
@@ -75,6 +78,8 @@ SNAPSHOT_COLUMNS = (
     "edge",
 )
 
+SCHEMA_VERSION = 2
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS bets (
     bet_id       TEXT PRIMARY KEY,
@@ -112,7 +117,8 @@ CREATE TABLE IF NOT EXISTS settlements (
     pnl            REAL NOT NULL,
     closing_price  REAL,
     closing_source TEXT,
-    log_clv        REAL
+    log_clv        REAL,
+    log_clv_raw    REAL
 );
 
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -156,9 +162,39 @@ def connect(path: Path | str) -> sqlite3.Connection:
     conn = sqlite3.connect(str(p))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 10000")
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
     return conn
+
+
+def _migrate(conn: sqlite3.Connection, commission: float = 0.06) -> None:
+    """Bring an older ledger up to ``SCHEMA_VERSION`` (tracked in ``PRAGMA user_version``).
+
+    v0/v1 -> v2: ``settlements.log_clv`` used to hold the RAW log-CLV. It moves to the new
+    ``log_clv_raw`` column and ``log_clv`` is recomputed NET of commission from ``price_taken``.
+    """
+    ver = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if ver > SCHEMA_VERSION:
+        raise RuntimeError(f"ledger schema v{ver} is newer than this code (v{SCHEMA_VERSION})")
+    if ver == SCHEMA_VERSION:
+        return
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(settlements)")}
+    if "log_clv_raw" not in cols:
+        conn.execute("ALTER TABLE settlements ADD COLUMN log_clv_raw REAL")
+        rows = conn.execute(
+            "SELECT s.bet_id, s.log_clv, b.price_taken FROM settlements s "
+            "JOIN bets b USING (bet_id) WHERE s.log_clv IS NOT NULL"
+        ).fetchall()
+        for bet_id_, raw, price in rows:
+            net = raw + float(np.log(float(net_odds(price, commission)) / price))
+            conn.execute(
+                "UPDATE settlements SET log_clv_raw = ?, log_clv = ? WHERE bet_id = ?",
+                (raw, net, bet_id_),
+            )
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 def insert_bets(conn: sqlite3.Connection, rows: Iterable[dict]) -> list[dict]:
@@ -240,10 +276,11 @@ def record_settlements(conn: sqlite3.Connection, rows: Iterable[dict]) -> list[d
         "closing_price",
         "closing_source",
         "log_clv",
+        "log_clv_raw",
     )
     conn.executemany(
         f"INSERT INTO settlements ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
-        [tuple(r[c] for c in cols) for r in fresh],
+        [tuple(r[c] if c in r.keys() else None for c in cols) for r in fresh],
     )
     conn.commit()
     return fresh
@@ -261,7 +298,7 @@ def bets_with_settlements(conn: sqlite3.Connection) -> pd.DataFrame:
     return pd.read_sql_query(
         """
         SELECT b.*, s.settled_utc, s.result, s.won AS settled_won, s.pnl,
-               s.closing_price, s.closing_source, s.log_clv
+               s.closing_price, s.closing_source, s.log_clv, s.log_clv_raw
         FROM bets b LEFT JOIN settlements s ON s.bet_id = b.bet_id
         ORDER BY b.kickoff_utc, b.match_key, b.market
         """,

@@ -47,6 +47,23 @@ def load_strategy(path: Path | str = "config/strategy.toml") -> dict:
                 raise ValueError(f"{path}: [markets.{market}] missing {key}")
     shadow = cfg.get("shadow", {})
     cfg["shadow_threshold"] = float(shadow.get("shadow_threshold", DEFAULT_SHADOW_THRESHOLD))
+    mode = str(cfg["mode"])
+    if mode not in ("paper", "shadow"):
+        raise ValueError(f"{path}: mode must be 'paper' or 'shadow', got {mode!r}")
+    if mode == "paper" and not cfg["gate0_passed"]:
+        # paper bets count towards Gate 1; without a passed Gate 0 they must not be recorded (m6)
+        raise ValueError(
+            f"{path}: mode = 'paper' with gate0_passed = false. Paper bets count towards Gate 1, "
+            "so a failed Gate 0 must run the desk in shadow mode."
+        )
+    for market in SELS:
+        sec = cfg["markets"][market]
+        for key in ("threshold", "pool_weight"):
+            val = float(sec[key])
+            if not 0.0 <= val <= 1.0:
+                raise ValueError(f"{path}: [markets.{market}] {key} must be in [0, 1], got {val}")
+    if not 0.0 <= cfg["shadow_threshold"] <= 1.0:
+        raise ValueError(f"{path}: shadow_threshold must be in [0, 1]")
     return cfg
 
 
@@ -105,7 +122,12 @@ def candidate_bets(
         thr = market_threshold(strategy, market, mode)
         wl = market_whitelist(strategy, market, mode)
         g = df[(df["market"] == market) & (df["edge"] >= thr)]
-        if wl:
+        if mode != "shadow":
+            # Paper mode: an empty whitelist (or qualified = false) means "no division", exactly as
+            # in the backtest (fold["div"].isin(cfg["whitelist"])). Never "every division".
+            sec = strategy["markets"][market]
+            if not wl or sec.get("qualified", True) is False:
+                continue
             g = g[g["div"].isin(wl)]
         if g.empty:
             continue
@@ -133,6 +155,13 @@ def plan_bets(
     """Bet rows for the top ``remaining`` candidates, highest edge first (never above the cap)."""
     mode = str(strategy["mode"])
     cand = candidate_bets(edges, fixtures, strategy, mode)
+    # Re-check the kickoff at insert time: the model fits above can take minutes, so a fixture that
+    # was in the future when the scan started may have kicked off since (picks.candidate_bets only
+    # knows the fixtures, not the clock). Never bet a match that has started.
+    if not cand.empty and "kickoff_utc" in cand.columns:
+        now = pd.Timestamp(now_utc)
+        now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
+        cand = cand[pd.to_datetime(cand["kickoff_utc"], utc=True) > now]
     rows = []
     for r in cand.head(max(remaining, 0)).itertuples(index=False):
         frac, units = risk.stake_units(float(r.pooled_prob), float(r.price), limits)
@@ -166,6 +195,18 @@ def plan_bets(
         )
     # sort for a deterministic insert order (and a stable digest), edge first
     return sorted(rows, key=lambda b: (-b["edge"], b["match_key"], b["market"], b["selection"]))
+
+
+def gate0_hash(path: Path | str) -> str:
+    """sha256 of the Gate 0 report, raising when the report is missing or empty.
+
+    A missing report used to stamp every bet with an empty string, which silently breaks the
+    report-hash provenance on the ledger; fail loudly instead.
+    """
+    h = file_hash(path)
+    if not h:
+        raise FileNotFoundError(f"Gate 0 report not found or empty: {path}")
+    return h
 
 
 def snapshot_rows(edges: pd.DataFrame, fixtures: pd.DataFrame, now_utc) -> list[dict]:

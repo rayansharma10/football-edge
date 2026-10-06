@@ -40,7 +40,7 @@ def parse_args(argv=None):
 
 
 def metrics(settled: pd.DataFrame, limits: risk.Limits) -> dict:
-    """Settled count, mean log-CLV with CI, flat and Kelly ROI and max drawdown."""
+    """Settled count, mean net log-CLV with CI, flat and Kelly ROI and max drawdown."""
     n = len(settled)
     if n == 0:
         return {"n": 0}
@@ -84,18 +84,27 @@ def fmt(v, pct=True, nd=2) -> str:
     return f"{v * 100:+.{nd}f}%" if pct else f"{v:.{nd}f}"
 
 
+def fmt_dd(v, nd=2) -> str:
+    """A drawdown as an unsigned percentage: it is a loss, so a leading ``+`` is misleading (n5)."""
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "-"
+    return f"{abs(float(v)) * 100:.{nd}f}%"
+
+
 def clv_text(m: dict) -> str:
     if "clv_mean" not in m:
         return "no settled bet has a closing price yet"
     if "clv_lo" in m:
         return (
-            f"mean log-CLV {fmt(m['clv_mean'])} "
+            f"mean net log-CLV {fmt(m['clv_mean'])} "
             f"[{fmt(m['clv_lo'])}, {fmt(m['clv_hi'])}] (n={m['clv_n']})"
         )
-    return f"mean log-CLV {fmt(m['clv_mean'])} (no CI yet, n={m['clv_n']} < {CI_MIN_N})"
+    return f"mean net log-CLV {fmt(m['clv_mean'])} (no CI yet, n={m['clv_n']} < {CI_MIN_N})"
 
 
-def build_report(conn, strategy: dict, limits: risk.Limits, now: pd.Timestamp) -> tuple:
+def build_report(
+    conn, strategy: dict, limits: risk.Limits, now: pd.Timestamp, config_path=None
+) -> tuple:
     """``(markdown, summary dict)`` for the weekly report."""
     bets = ledger.bets_with_settlements(conn)
     settled = ledger.settled_frame(conn)
@@ -108,8 +117,8 @@ def build_report(conn, strategy: dict, limits: risk.Limits, now: pd.Timestamp) -
     gate_passed = bool(strategy["gate0_passed"])
 
     sydney_day = now.tz_convert("Australia/Sydney").strftime("%Y-%m-%d")
-    cfg_hash = picks.file_hash(ROOT / "config" / "strategy.toml")
-    gate_hash = picks.file_hash(ROOT / "reports" / "gate0.md")
+    cfg_hash = picks.file_hash(config_path or ROOT / "config" / "strategy.toml")
+    gate_hash = picks.gate0_hash(ROOT / "reports" / "gate0.md")
     lines = [
         f"# football-edge paper desk: weekly report {sydney_day}",
         "",
@@ -136,13 +145,13 @@ def build_report(conn, strategy: dict, limits: risk.Limits, now: pd.Timestamp) -
         f"- {clv_text(m)}",
         f"- Flat ROI {fmt(m.get('roi_flat'))} on {fmt(m.get('turnover'), pct=False)}u turnover; "
         f"Kelly({limits.kelly_fraction:g}) ROI {fmt(m.get('roi_kelly'))}",
-        f"- Max drawdown: Kelly {fmt(m.get('max_drawdown'), nd=2)} / flat {fmt(m.get('mdd_flat'))}",
+        f"- Max drawdown: Kelly {fmt_dd(m.get('max_drawdown'))} / flat {fmt_dd(m.get('mdd_flat'))}",
         f"- Paper only: n={m_paper.get('n', 0)}, {clv_text(m_paper)}",
         f"- Shadow only: n={m_shadow.get('n', 0)}, {clv_text(m_shadow)}",
         "",
         "## By league (settled bets)",
         "",
-        "| Div | n | mean log-CLV | flat ROI |",
+        "| Div | n | mean net log-CLV | flat ROI |",
         "|---|---|---|---|",
     ]
     if len(settled):
@@ -169,11 +178,20 @@ def build_report(conn, strategy: dict, limits: risk.Limits, now: pd.Timestamp) -
         "- The real collection time of the football-data `pre` price is unverified; the snapshot "
         "is stamped with the download time (`seen_utc`), not the kickoff-24h assumption of the "
         "backtest.",
-        "- CLV is measured against the margin-free (power de-vig) closing probability, `BFEC*` if "
+        "- CLV is NET of 6% commission: log(net_odds(price taken) x margin-free closing "
+        "probability). The raw (pre-commission) CLV is stored as `log_clv_raw` and is "
+        "optimistic by 3-5 pp; do not compare it with the Gate 1 bar. The closing "
+        "probability is power de-vig, `BFEC*` if "
         "both sides are quoted, else `AvgC*`.",
         "- Shadow bets are logged only when the model is confident enough to bet a fixture whose "
         f"kickoff is in the future; the shadow edge threshold is "
         f"{strategy['shadow_threshold']:.2%}.",
+        "- Stakes are a fixed fraction of the starting 1000u bankroll (not compounded on the "
+        "ledger's running balance). The Kelly ROI column is the backtest's compounding Kelly, so "
+        "`flat ROI` is the number that matches `stake_units`; treat the Kelly figure as a "
+        "sizing-rule comparison, not as the ledger's P&L.",
+        "- The drawdown kill switch gates `paper` bets only. Shadow bets carry no money and "
+        "blocking them on a hypothetical drawdown would freeze evidence collection.",
         "",
     ]
     summary = {
@@ -201,7 +219,7 @@ def format_summary(summary: dict, strategy: dict, limits: risk.Limits) -> str:
         f"fedge weekly: Gate 0 {gate} | bets {summary['bets']} "
         f"({summary['settled']} settled: {summary['settled_paper']} paper / "
         f"{summary['settled_shadow']} shadow) | snapshots {summary['snapshots']} | "
-        f"mean log-CLV {clv} (n={summary['clv_n']}) | flat ROI {roi}, "
+        f"mean net log-CLV {clv} (n={summary['clv_n']}) | flat ROI {roi}, "
         f"Kelly({limits.kelly_fraction:g}) ROI {kroi} | "
         f"Gate 1 {summary['settled_paper']}/{GATE1_BETS}"
     )
@@ -214,7 +232,7 @@ def main(argv=None) -> int:
     conn = ledger.connect(ledger.default_path(args.data_dir))
     now = pd.Timestamp(args.now) if args.now else pd.Timestamp.now(tz="UTC")
     now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
-    md, summary = build_report(conn, strategy, limits, now)
+    md, summary = build_report(conn, strategy, limits, now, args.config)
     out = Path(args.reports) / f"{now.tz_convert('Australia/Sydney').strftime('%Y-%m-%d')}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(md, encoding="utf-8", newline="\n")

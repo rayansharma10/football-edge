@@ -5,7 +5,10 @@ Definitions, all reused from earlier cards rather than re-derived:
 * ``won``: the selection won the market (1X2 from ``FTR``; over/under 2.5 from the total goals).
 * ``pnl``: ``stake * (price - 1) * (1 - commission)`` for a winner, ``-stake`` for a loser, i.e. 6%
   commission on net winnings (AGENTS.md rule 10).
-* ``log_clv``: ``log(price_taken * p_close_fair)`` where ``p_close_fair`` is the *margin-free*
+* ``log_clv`` (NET, the gate variable): ``log(net_odds(price_taken) * p_close_fair)``, the price
+  after commission on winnings (AGENTS.md rule 10). ``log_clv_raw`` is the same without
+  commission, ``log(price_taken * p_close_fair)``; it is optimistic by 3-5 pp and kept for
+  reference only. ``p_close_fair`` is the *margin-free*
   (power) closing probability of the selection (:mod:`fedge.market`; see
   :func:`fedge.backtest.stats.log_clv`). The closing price itself is the Betfair Exchange close
   (``BFEC*``) when both sides of the market are quoted, otherwise the market average close
@@ -17,7 +20,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from fedge.backtest.stats import log_clv
+from fedge.backtest.stats import log_clv, net_odds
 from fedge.market import devig
 
 SELS = {"1x2": ("H", "D", "A"), "ou25": ("over", "under")}
@@ -49,7 +52,11 @@ def pnl(stake_units: float, price_taken: float, is_winner: bool, commission: flo
 
 
 def wide_prices(odds: pd.DataFrame, book: str, market: str, phase: str) -> pd.DataFrame:
-    """Complete de-marginable prices for (book, market, phase), indexed by ``match_id``."""
+    """Complete de-marginable prices for (book, market, phase), indexed by ``match_id``.
+
+    Rows with a non-positive/nonsense quote (``<= 1.0``) are dropped: one bad quote would otherwise
+    make the de-vig raise and abort the whole settlement run (m8).
+    """
     sels = list(SELS[market])
     o = odds.loc[
         (odds["bookmaker"] == book) & (odds["market"] == market) & (odds["phase"] == phase)
@@ -57,7 +64,11 @@ def wide_prices(odds: pd.DataFrame, book: str, market: str, phase: str) -> pd.Da
     if o.empty:
         return pd.DataFrame(columns=sels)
     w = o.pivot_table(index="match_id", columns="selection", values="price", aggfunc="first")
-    return w[sels].dropna() if set(sels).issubset(w.columns) else pd.DataFrame(columns=sels)
+    if not set(sels).issubset(w.columns):
+        return pd.DataFrame(columns=sels)
+    w = w[sels].dropna()
+    price = w.to_numpy(dtype=float)
+    return w[np.all(price > 1.0, axis=1)]
 
 
 def closing_probabilities(odds: pd.DataFrame, market: str) -> pd.DataFrame:
@@ -109,9 +120,13 @@ def settle_bet(
         "closing_price": None,
         "closing_source": None,
         "log_clv": None,
+        "log_clv_raw": None,
     }
     if close and close.get("p_fair") is not None:
         row["closing_price"] = None if close.get("price") is None else float(close["price"])
         row["closing_source"] = str(close["source"])
-        row["log_clv"] = float(log_clv(float(bet["price_taken"]), float(close["p_fair"])))
+        price = float(bet["price_taken"])
+        p_fair = float(close["p_fair"])
+        row["log_clv_raw"] = float(log_clv(price, p_fair))
+        row["log_clv"] = float(log_clv(float(net_odds(price, commission)), p_fair))
     return row

@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from fedge.backtest.stats import net_odds
 from fedge.ingest.football_data import make_match_id
 from fedge.paper import fixtures as fx
 from fedge.paper import ledger, model_state, picks, risk, settle
@@ -219,7 +220,22 @@ def test_settle_bet_log_clv_uses_the_fair_closing_probability():
     row = settle.settle_bet(_bet(price=4.0), 2, 0, "H", "now", commission=0.06, close=close)
     assert row["closing_price"] == 3.2
     assert row["closing_source"] == "BFE"
-    assert row["log_clv"] == pytest.approx(float(np.log(4.0 * 0.3)))
+    # log_clv is NET of commission (the gate variable); log_clv_raw is the pre-commission value
+    assert row["log_clv_raw"] == pytest.approx(float(np.log(4.0 * 0.3)))
+    assert row["log_clv"] == pytest.approx(float(np.log(net_odds(4.0, 0.06) * 0.3)))
+
+
+def test_settle_bet_net_clv_is_the_raw_clv_shifted_by_the_commission():
+    """Pin the relation the migration and the desk's gate both rely on."""
+    for price in (1.5, 2.0, 2.76, 4.0, 6.0):
+        close = {"price": price, "source": "BFE", "p_fair": 0.3}
+        row = settle.settle_bet(
+            _bet(price=price), 2, 0, "H", "now", commission=0.06, close=close
+        )
+        assert row["log_clv"] == pytest.approx(
+            row["log_clv_raw"] + float(np.log(net_odds(price, 0.06) / price))
+        )
+        assert row["log_clv"] < row["log_clv_raw"]  # raw is the optimistic one
 
 
 def _odds_long() -> pd.DataFrame:
@@ -720,3 +736,216 @@ def test_training_table_and_fixture_features_shapes(tmp_path):
     assert model_state.season_of(pd.Timestamp("2027-06-30T12:00:00Z")) == "2026/27"
     assert model_state.season_of(pd.Timestamp("2027-07-01T12:00:00Z")) == "2027/28"
     assert model_state.season_of(pd.Timestamp("2027-11-01T12:00:00Z")) == "2027/28"
+
+
+# ------------------------------------------------- P6 follow-ups from review_p6 (M2, m1, m2, m9)
+def test_paper_mode_empty_whitelist_selects_nothing_not_everything():
+    """The committed in-fold shape: qualified=false, threshold=0.06, whitelist=[].
+
+    reports/gate0_fold_configs.csv has exactly this for the exchange folds 2022/23..2026/27. The
+    backtest reads an empty whitelist as "no division" (strategy.py: fold["div"].isin(cfg[...])),
+    so paper mode must too - never as "every division".
+    """
+    strategy = _strategy(gate0=True)  # gate0=True -> mode "paper", whitelists empty
+    for market in strategy["markets"].values():
+        market["qualified"] = False
+    edges = _edges(
+        [
+            dict(match_key="k0", market="1x2", selection="H", price=4.0, price_source="BFE",
+                 model_prob=0.3, market_prob=0.25, pooled_prob=0.3, edge=0.07),
+            dict(match_key="k1", market="ou25", selection="over", price=2.5, price_source="BFE",
+                 model_prob=0.4, market_prob=0.37, pooled_prob=0.4, edge=0.07),
+        ]
+    )
+    cand = picks.candidate_bets(edges, _fixtures_frame(2), strategy, "paper")
+    assert cand.empty
+    bets = picks.plan_bets(
+        edges, _fixtures_frame(2), strategy, risk.Limits(), 5,
+        pd.Timestamp("2026-10-06T08:00:00Z"), "cfg", "gate", "exp",
+    )
+    assert bets == []
+
+
+def test_plan_bets_never_bets_a_fixture_that_has_already_kicked_off():
+    """The model fits take minutes, so the kickoff is re-checked at insert time (m2)."""
+    edges = _edges(
+        [
+            dict(match_key="k0", market="1x2", selection="H", price=4.0, price_source="BFE",
+                 model_prob=0.5, market_prob=0.4, pooled_prob=0.5, edge=0.9),
+            dict(match_key="k1", market="1x2", selection="H", price=4.0, price_source="BFE",
+                 model_prob=0.5, market_prob=0.4, pooled_prob=0.5, edge=0.9),
+        ]
+    )
+    f = _fixtures_frame(2)  # kickoffs T0, T0+1d (2027-11-01/02)
+    now = T0 + pd.Timedelta(minutes=5)  # after k0's kickoff, before k1's
+    out = picks.plan_bets(edges, f, _strategy(), risk.Limits(), 5, now, "cfg", "gate", "exp")
+    assert [b["match_key"] for b in out] == ["k1"]
+
+
+def test_settle_matches_a_moved_fixture_by_division_and_teams():
+    """A rescheduled fixture keeps its teams but changes match_id: settle via the +/-3d fallback."""
+    settle_script = _script("paper_settle")
+    bet = {
+        "match_key": make_match_id("SP2", "03/10/2026", "Sabadell", "Andorra"),
+        "div": "SP2",
+        "home": "Sabadell",
+        "away": "Andorra",
+        "kickoff_utc": "2026-10-03T16:30:00+00:00",
+    }
+    moved = make_match_id("SP2", "04/10/2026", "Sabadell", "Andorra")
+    played = pd.DataFrame(
+        [
+            {"match_id": moved, "div": "SP2", "home": "Sabadell", "away": "Andorra",
+             "kickoff_utc": pd.Timestamp("2026-10-04T19:00:00Z"), "FTHG": 2.0, "FTAG": 1.0,
+             "FTR": "H"},
+            {"match_id": make_match_id("E0", "04/10/2026", "Arsenal", "Chelsea"), "div": "E0",
+             "home": "Arsenal", "away": "Chelsea",
+             "kickoff_utc": pd.Timestamp("2026-10-04T14:00:00Z"), "FTHG": 1.0, "FTAG": 0.0,
+             "FTR": "H"},
+        ]
+    )
+    results = settle_script.load_results(played)
+    found = settle_script.match_result(results, played, bet)
+    assert found is not None
+    res, mid = found
+    assert mid == moved and float(res["FTHG"]) == 2.0
+
+    # more than 3 days away (a genuinely different fixture): no match, so nothing settles
+    far = dict(bet, kickoff_utc="2026-10-15T16:30:00+00:00")
+    assert settle_script.match_result(results, played, far) is None
+
+
+def test_settle_ignores_a_nonsense_closing_price():
+    """One bad closing quote must not abort the settlement run (m8): settle without CLV."""
+    settle_script = _script("paper_settle")
+    data = pd.DataFrame(
+        [
+            {"match_id": "m1", "bookmaker": "BFE", "market": "1x2", "selection": "H",
+             "phase": "close", "price": 0.0},
+            {"match_id": "m1", "bookmaker": "BFE", "market": "1x2", "selection": "D",
+             "phase": "close", "price": 3.3},
+            {"match_id": "m1", "bookmaker": "BFE", "market": "1x2", "selection": "A",
+             "phase": "close", "price": 2.2},
+        ]
+    )
+    cache = settle_script.close_lookup(data)
+    assert settle_script.closing_info(cache, "1x2", "m1", "H") is None
+
+
+def test_load_strategy_refuses_paper_mode_without_a_passed_gate0(tmp_path):
+    """m6: paper bets count towards Gate 1, so mode=paper requires gate0_passed = true."""
+    p = tmp_path / "s.toml"
+    p.write_text(
+        "gate0_passed = false\nmode = \"paper\"\n"
+        "[markets.1x2]\nmodel = \"m\"\npool_weight = 0.5\nthreshold = 0.06\nwhitelist = []\n"
+        "[markets.ou25]\nmodel = \"m\"\npool_weight = 0.5\nthreshold = 0.06\nwhitelist = []\n"
+    )
+    with pytest.raises(ValueError, match="gate0_passed"):
+        picks.load_strategy(p)
+    p.write_text(p.read_text().replace("gate0_passed = false", "gate0_passed = true"))
+    assert picks.load_strategy(p)["mode"] == "paper"
+    # an out-of-range threshold or a bad mode is refused too
+    p.write_text(p.read_text().replace("threshold = 0.06", "threshold = 1.5", 1))
+    with pytest.raises(ValueError, match="threshold"):
+        picks.load_strategy(p)
+
+
+def test_load_limits_refuses_out_of_range_caps(tmp_path):
+    """m6: a mis-typed cap must stop the desk, not silently size stakes."""
+    p = tmp_path / "limits.toml"
+    p.write_text(
+        "LIVE = false\ncommission = 0.06\nmax_stake_frac = 1.5\nkelly_fraction = 0.25\n"
+        "max_bets_per_day = 20\ndrawdown_kill = 0.2\n"
+    )
+    with pytest.raises(ValueError, match="max_stake_frac"):
+        risk.load_limits(p)
+
+
+def test_shadow_mode_drawdown_does_not_block_the_desk(tmp_path):
+    """m3: shadow P&L is hypothetical, so it must not trip the paper kill switch."""
+    conn = ledger.connect(tmp_path / "paper.sqlite")
+    try:
+        bets = [
+            _bet(match_key=f"k{i}", price=2.0, stake=10.0, mode="shadow",
+                 kickoff=T0 + pd.Timedelta(days=i)) for i in range(3)
+        ]
+        ledger.insert_bets(conn, bets)
+        ledger.record_settlements(conn, [
+            {"bet_id": b["bet_id"], "settled_utc": "t", "result": "A", "won": 0, "pnl": -300.0,
+             "closing_price": None, "closing_source": None, "log_clv": None} for b in bets
+        ])
+        limits = risk.Limits(drawdown_kill=0.2)
+        shadow_state = risk.daily_state(conn, limits, tmp_path, today="2027-11-01", mode="shadow")
+        assert shadow_state["drawdown"] > 0.2  # the hypothetical loss is visible...
+        assert shadow_state["blocked"] is False  # ...but does not block
+        paper_state = risk.daily_state(conn, limits, tmp_path, today="2027-11-01", mode="paper")
+        assert paper_state["blocked"] is False  # paper ledger is untouched by shadow P&L
+        mixed = risk.daily_state(conn, limits, tmp_path, today="2027-11-01")
+        assert mixed["blocked"] is True  # unscoped (legacy) view still sees the drawdown
+    finally:
+        conn.close()
+
+
+def test_no_order_placement_code_in_the_paper_path():
+    """AGENTS.md rule 2: the desk is paper-only until Gate 2 is signed off."""
+    forbidden = ("place_orders", "placeOrders", "flumine", "betfairlightweight")
+    hits = []
+    for path in sorted((ROOT / "src").rglob("*.py")) + sorted((ROOT / "scripts").rglob("*.py")):
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        hits += [f"{path.relative_to(ROOT)}: {tok}" for tok in forbidden if tok in text]
+    assert hits == []
+
+
+def test_connect_migrates_a_raw_clv_ledger_to_net_clv(tmp_path):
+    """A pre-existing data/paper.sqlite stores RAW log_clv; connect() moves it to log_clv_raw."""
+    p = tmp_path / "old.sqlite"
+    old = sqlite3.connect(str(p))
+    old.executescript(
+        """
+        CREATE TABLE bets (
+            bet_id TEXT PRIMARY KEY, created_utc TEXT NOT NULL, match_key TEXT NOT NULL,
+            div TEXT NOT NULL, date TEXT NOT NULL, home TEXT NOT NULL, away TEXT NOT NULL,
+            kickoff_utc TEXT NOT NULL, market TEXT NOT NULL, selection TEXT NOT NULL,
+            model_prob REAL, market_prob REAL, pooled_prob REAL, price_taken REAL NOT NULL,
+            price_source TEXT NOT NULL, edge REAL NOT NULL, stake_units REAL NOT NULL,
+            stake_frac REAL NOT NULL, mode TEXT NOT NULL, config_hash TEXT NOT NULL,
+            gate0_hash TEXT NOT NULL, experiment_id TEXT NOT NULL
+        );
+        CREATE TABLE settlements (
+            bet_id TEXT PRIMARY KEY, settled_utc TEXT NOT NULL, result TEXT NOT NULL,
+            won INTEGER NOT NULL, pnl REAL NOT NULL, closing_price REAL,
+            closing_source TEXT, log_clv REAL
+        );
+        """
+    )
+    raw = float(np.log(4.0 * 0.3))
+    old.execute(
+        "INSERT INTO bets VALUES ('b1','t','k0','E2','2027-11-01','H','A','2027-11-01T15:00:00Z',"
+        "'1x2','H',0.3,0.25,0.3,4.0,'BFE',0.1,1.0,0.01,'shadow','c','g','e')"
+    )
+    old.execute("INSERT INTO settlements VALUES ('b1','t','H',1,2.82,3.2,'BFE',?)", (raw,))
+    old.commit()
+    old.close()
+
+    conn = ledger.connect(p)
+    try:
+        out = ledger.bets_with_settlements(conn)
+        assert out.loc[0, "log_clv_raw"] == pytest.approx(raw)
+        assert out.loc[0, "log_clv"] == pytest.approx(
+            raw + float(np.log(net_odds(4.0, 0.06) / 4.0))
+        )
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == ledger.SCHEMA_VERSION
+        # idempotent: reconnecting does not re-migrate or double-shift
+        conn.close()
+        again = ledger.connect(p)
+        assert again.execute("PRAGMA user_version").fetchone()[0] == ledger.SCHEMA_VERSION
+        assert again.execute("SELECT log_clv FROM settlements").fetchone()[0] == pytest.approx(
+            raw + float(np.log(net_odds(4.0, 0.06) / 4.0))
+        )
+        again.close()
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001 - already closed above
+            pass
+

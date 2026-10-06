@@ -9,9 +9,9 @@
 2. Every unsettled bet whose match now has a result is settled: ``pnl`` after 6% commission on net
    winnings (``fedge.paper.settle``), the quoted closing price and its source, and the log-CLV
    against the margin-free (power) closing probability.
-3. STDOUT: a digest of the newly settled bets plus running totals (settled count, mean log-CLV with
-   a match-clustered 95% CI once n >= 30, flat ROI) — printed **only** when something settled.
-   Errors exit non-zero with one line on stderr.
+3. STDOUT: a digest of the newly settled bets plus running totals (settled count, mean net
+   log-CLV with a match-clustered 95% CI once n >= 30, flat ROI) — printed **only** when
+   something settled. Errors exit non-zero with one line on stderr.
 """
 
 from __future__ import annotations
@@ -70,8 +70,11 @@ def closing_info(cache: dict, market: str, match_id: str, selection: str) -> dic
     wide = settle.wide_prices(odds, source, market, "close")
     if match_id not in wide.index:
         return None
+    price = float(wide.loc[match_id, selection])
+    if not price > 1.0:  # one bad quote must not abort the whole settlement run
+        return None
     return {
-        "price": float(wide.loc[match_id, selection]),
+        "price": price,
         "source": source,
         "p_fair": float(row[selection]),
     }
@@ -90,12 +93,12 @@ def running_totals(settled: pd.DataFrame) -> str:
                 clv.to_numpy(dtype=float), settled.loc[clv.index, "match_key"].to_numpy()
             )
             parts.append(
-                f"mean log-CLV {ci['mean'] * 100:+.2f}% "
+                f"mean net log-CLV {ci['mean'] * 100:+.2f}% "
                 f"[{ci['lo'] * 100:+.2f}, {ci['hi'] * 100:+.2f}] (n={len(clv)})"
             )
         else:
             parts.append(
-                f"mean log-CLV {clv.mean() * 100:+.2f}% (no CI yet, n={len(clv)} < {CI_MIN_N})"
+                f"mean net log-CLV {clv.mean() * 100:+.2f}% (no CI yet, n={len(clv)} < {CI_MIN_N})"
             )
     turnover = float(settled["stake_units"].sum())
     roi = float(settled["pnl"].sum()) / turnover * 100
@@ -116,6 +119,37 @@ def format_digest(new: list[dict], settled: pd.DataFrame, now) -> str:
     return "\n".join(lines)
 
 
+MATCH_TOLERANCE = pd.Timedelta(days=3)
+
+
+def _by_teams(played: pd.DataFrame) -> dict:
+    """``{(div, home, away): [(kickoff, match_id), ...]}`` for the moved-fixture fallback."""
+    out: dict = {}
+    for r in played.itertuples(index=False):
+        out.setdefault((r.div, r.home, r.away), []).append((r.kickoff_utc, r.match_id))
+    return out
+
+
+def match_result(results: pd.DataFrame, played: pd.DataFrame, bet: dict):
+    """``(result_row, match_id)`` for a bet, or ``None`` when the match is not in the results.
+
+    Primary join is the exact ``match_key``. A fixture whose kickoff moved keeps its teams but
+    changes its ``match_id`` (``make_match_id`` hashes div+date+teams), so fall back to the same
+    ``(div, home, away)`` within ``MATCH_TOLERANCE`` (+/- 3 days) of the bet's kickoff: without it
+    a rescheduled fixture silently never settles.
+    """
+    mid = str(bet["match_key"])
+    if mid in results.index:
+        return results.loc[mid], mid
+    ko = pd.Timestamp(bet["kickoff_utc"])
+    ko = ko.tz_localize("UTC") if ko.tzinfo is None else ko.tz_convert("UTC")
+    key = (bet["div"], bet["home"], bet["away"])
+    for cand_ko, cand_id in _by_teams(played).get(key, []):
+        if abs(cand_ko - ko) <= MATCH_TOLERANCE and cand_id in results.index:
+            return results.loc[cand_id], str(cand_id)
+    return None
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     limits = risk.load_limits(args.limits)
@@ -133,13 +167,15 @@ def main(argv=None) -> int:
 
     now = pd.Timestamp.now(tz="UTC")
     now_iso = now.isoformat()
-    rows, skipped = [], 0
+    rows, skipped, moved = [], 0, 0
     for bet in pending.to_dict("records"):
-        mid = bet["match_key"]
-        if mid not in results.index:
+        found = match_result(results, played, bet)
+        if found is None:
             skipped += 1
             continue
-        res = results.loc[mid]
+        res, mid = found
+        if mid != bet["match_key"]:
+            moved += 1
         close = closing_info(cache, bet["market"], mid, bet["selection"])
         row = settle.settle_bet(
             bet,
@@ -168,7 +204,9 @@ def main(argv=None) -> int:
     print(format_digest(new, settled, now))
     print(
         f"paper_settle: settled {len(new)} of {len(pending)} open bets ({skipped} still without "
-        f"a result); ledger holds {len(settled)} settled bets",
+        f"a result"
+        + (f", {moved} matched by (div, home, away) after a moved kickoff" if moved else "")
+        + f"); ledger holds {len(settled)} settled bets",
         file=sys.stderr,
     )
     return 0

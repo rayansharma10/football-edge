@@ -46,7 +46,7 @@ class Limits:
 
 
 def load_limits(path: Path | str = DEFAULT_LIMITS) -> Limits:
-    """Read ``limits.toml``. Refuses to run with ``LIVE = true``."""
+    """Read ``limits.toml``. Refuses to run with ``LIVE = true`` or an out-of-range cap (m6)."""
     with open(path, "rb") as f:
         cfg = tomllib.load(f)
     if cfg.get("LIVE", False):
@@ -54,13 +54,24 @@ def load_limits(path: Path | str = DEFAULT_LIMITS) -> Limits:
             f"{path}: LIVE = true. The paper desk never places a real bet (AGENTS.md rule 2); "
             "live trading needs Gate 2 sign-off and a separate execution card."
         )
-    return Limits(
+    limits = Limits(
         commission=float(cfg["commission"]),
         max_stake_frac=float(cfg["max_stake_frac"]),
         kelly_fraction=float(cfg["kelly_fraction"]),
         max_bets_per_day=int(cfg["max_bets_per_day"]),
         drawdown_kill=float(cfg["drawdown_kill"]),
     )
+    for name, value in (
+        ("commission", limits.commission),
+        ("max_stake_frac", limits.max_stake_frac),
+        ("kelly_fraction", limits.kelly_fraction),
+        ("drawdown_kill", limits.drawdown_kill),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{path}: {name} must be a fraction in [0, 1], got {value}")
+    if limits.max_bets_per_day < 1:
+        raise ValueError(f"{path}: max_bets_per_day must be >= 1")
+    return limits
 
 
 def kill_path(data_dir: Path | str = "data") -> Path:
@@ -113,20 +124,26 @@ def daily_state(
     data_dir: Path | str = "data",
     today: str | None = None,
     bankroll0: float = BANKROLL0,
+    mode: str | None = None,
 ) -> dict:
     """Whether the desk may bet today, and why not if it may not.
 
     Returns ``{'today', 'placed_today', 'remaining', 'drawdown', 'blocked', 'reason'}``. ``blocked``
     is True for the kill-switch file or a realised drawdown at/over ``drawdown_kill``; ``remaining``
     is how many more bets may be written today (0 when blocked).
+
+    ``mode`` scopes the drawdown to one ledger (``paper``/``shadow``). Shadow bets are hypotheses
+    with no money at risk, and blocking them on a hypothetical drawdown would freeze the evidence
+    loop (no new bets -> no new settlements -> never unblocked), so the drawdown switch only gates
+    ``paper`` mode; shadow mode is gated by the file switch alone (m3).
     """
     today = today or pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d")
     placed = ledger.bets_placed_on(conn, today)
-    dd = realised_drawdown(ledger.settled_frame(conn), bankroll0)
+    dd = realised_drawdown(ledger.settled_frame(conn, mode), bankroll0)
     reason = None
     if kill_switch_active(data_dir):
         reason = f"kill switch file {kill_path(data_dir)} exists"
-    elif dd >= limits.drawdown_kill:
+    elif mode in (None, "paper") and dd >= limits.drawdown_kill:
         reason = f"realised drawdown {dd:.1%} >= limits drawdown_kill {limits.drawdown_kill:.0%}"
     remaining = 0 if reason else max(limits.max_bets_per_day - placed, 0)
     return {

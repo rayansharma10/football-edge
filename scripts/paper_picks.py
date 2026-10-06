@@ -78,7 +78,7 @@ def main(argv=None) -> int:
     strategy = picks.load_strategy(args.config)
     limits = risk.load_limits(args.limits)
     conn = ledger.connect(ledger.default_path(args.data_dir))
-    state = risk.daily_state(conn, limits, args.data_dir)
+    state = risk.daily_state(conn, limits, args.data_dir, mode=str(strategy["mode"]))
 
     if not args.no_refresh:
         model_state.refresh_ingest(args.data_dir, args.leagues, args.delay)
@@ -133,7 +133,7 @@ def main(argv=None) -> int:
         return 0
 
     cfg_hash = picks.file_hash(args.config)
-    gate_hash = picks.file_hash(args.gates)
+    gate_hash = picks.gate0_hash(args.gates)
     experiment = f"{strategy['mode']}-{cfg_hash[:8]}"
     snapshots = picks.snapshot_rows(edges, scored, now)
     remaining = 0 if state["blocked"] else state["remaining"]
