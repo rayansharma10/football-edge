@@ -533,11 +533,33 @@ def pick_env(tmp_path, monkeypatch):
     monkeypatch.setattr(mod.model_state, "refresh_ingest", lambda *a, **k: None)
     monkeypatch.setattr(mod.model_state, "played_matches", lambda *a, **k: _played())
     monkeypatch.setattr(mod.model_state, "score_all", _fake_score_all)
+    # the desk scores only the divisions named in the leagues config (config/leagues.toml
+    # desk_divisions; E0 + SP1 in production), so this test declares its own E2 desk
+    leagues = _leagues_toml(tmp_path / "leagues.toml", ["E2"])
     argv = [
         "--data-dir", str(data), "--config", str(cfg), "--limits", str(limits),
-        "--gates", str(gates), "--no-refresh",
+        "--gates", str(gates), "--leagues", str(leagues), "--no-refresh",
     ]
     return mod, argv, data
+
+
+def _leagues_toml(path: Path, desk: list[str]) -> Path:
+    items = ", ".join(f'"{d}"' for d in desk)
+    path.write_text(f'divisions = ["E0", "SP1"]\ndesk_divisions = [{items}]\n')
+    return path
+
+
+def test_picks_ignores_fixtures_outside_the_desk_divisions(pick_env, capsys):
+    """A fixture in a league the desk does not cover is not scored and not bet."""
+    mod, argv, data = pick_env
+    leagues = _leagues_toml(Path(argv[argv.index("--leagues") + 1]).with_name("other.toml"), ["E0"])
+    assert mod.main([*argv, "--leagues", str(leagues)]) == 0
+    out, err = capsys.readouterr()
+    assert out == ""  # nothing bet, so the stdout digest contract stays silent
+    assert "modelled_fixtures=0" in err and "unmodelled_divs=['E2', 'SC3']" in err
+    conn = ledger.connect(ledger.default_path(data))
+    assert len(ledger.read_table(conn, "bets")) == 0
+    conn.close()
 
 
 def _fake_score_all(data_dir, strategy, played, fixtures, price_rows, weights, threads=4):

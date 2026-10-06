@@ -38,6 +38,8 @@ if str(ROOT / "src") not in sys.path:
 
 from fedge.paper import fixtures as fx  # noqa: E402
 from fedge.paper import ledger, model_state, picks, risk  # noqa: E402
+from fedge.predict import upcoming as pred  # noqa: E402
+from fedge.predict.upcoming import load_desk_divs  # noqa: E402
 
 
 def parse_args(argv=None):
@@ -71,6 +73,21 @@ def _fixture_inputs(args):
     return fixtures, rows, new
 
 
+def _refresh_predictions(args, edges, fixtures, played, now) -> None:
+    """Best-effort 'Upcoming predictions' refresh (stderr only; never affects bets or stdout)."""
+    try:
+        divs = load_desk_divs(args.leagues)
+        rows = pred.build_rows(edges, fixtures, played, now, now, desk_divs=divs)
+        conn = ledger.connect(ledger.default_path(args.data_dir))
+        n = pred.write_predictions(conn, rows)
+        modelled = sum(r["status"] == "modelled" for r in rows)
+        print(f"paper_picks: predictions table refreshed: {n} rows ({modelled} modelled)",
+              file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - display-only feature must not fail the picks run
+        print(f"paper_picks: predictions refresh skipped: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     now = pd.Timestamp.now(tz="UTC")
@@ -83,7 +100,8 @@ def main(argv=None) -> int:
     if not args.no_refresh:
         model_state.refresh_ingest(args.data_dir, args.leagues, args.delay)
     played = model_state.played_matches(args.data_dir)
-    modelled = set(played["div"].astype(str).unique())
+    # scope: only the desk divisions (config/leagues.toml desk_divisions) are scored and bet
+    modelled = set(played["div"].astype(str).unique()) & set(load_desk_divs(args.leagues))
 
     fixtures, rows, new = _fixture_inputs(args)
     fix_modelled = fixtures[fixtures["div"].isin(modelled)].copy()
@@ -110,12 +128,15 @@ def main(argv=None) -> int:
             "0 bets, 0 snapshots (see reports/weekly for the ledger totals)",
             file=sys.stderr,
         )
+        _refresh_predictions(args, pd.DataFrame(), fixtures, played, now)
         return 0
 
     scored = fix_modelled if args.dry_run else upcoming
     rows_scored = rows if args.dry_run else rows_up
     if rows_scored.empty:
         print("paper_picks: no priceable fixture to score", file=sys.stderr)
+        if not args.dry_run:
+            _refresh_predictions(args, pd.DataFrame(), fixtures, played, now)
         return 0
     scored = scored[scored["match_key"].isin(set(rows_scored["match_key"]))]
 
@@ -130,6 +151,7 @@ def main(argv=None) -> int:
     )
     if edges.empty:
         print("paper_picks: no fixture could be scored", file=sys.stderr)
+        _refresh_predictions(args, pd.DataFrame(), fixtures, played, now)
         return 0
 
     cfg_hash = picks.file_hash(args.config)
@@ -167,6 +189,9 @@ def main(argv=None) -> int:
         f"({len(bets)} planned, {remaining} of {limits.max_bets_per_day} daily slots left)",
         file=sys.stderr,
     )
+    # display-only: refresh the dashboard's predictions table (stderr only, after the digest)
+    if not args.dry_run:
+        _refresh_predictions(args, edges, fixtures, played, now)
     return 0
 
 
