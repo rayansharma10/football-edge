@@ -108,8 +108,28 @@ def season_of(kickoff_utc) -> str:
     return f"{y}/{str(y + 1)[2:]}"
 
 
+def _disjoint_batches(fixtures: pd.DataFrame):
+    """``((div, kickoff), frame)`` batches: equal division and kickoff, no team repeated."""
+    out = []
+    for key, grp in fixtures.groupby(["div", "kickoff_utc"], sort=False):
+        chunks: list[tuple[set, list]] = []
+        for i, f in enumerate(grp.itertuples(index=False)):
+            for used, idx in chunks:
+                if f.home not in used and f.away not in used:
+                    used.update((f.home, f.away))
+                    idx.append(i)
+                    break
+            else:
+                chunks.append(({f.home, f.away}, [i]))
+        out.extend((key, grp.iloc[idx]) for _, idx in chunks)
+    return out
+
+
 def fixture_features(
-    played: pd.DataFrame, fixtures: pd.DataFrame, div_codes: dict[str, int] | None = None
+    played: pd.DataFrame,
+    fixtures: pd.DataFrame,
+    div_codes: dict[str, int] | None = None,
+    match_xg: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Feature rows for the fixtures, one per ``match_key`` (index = ``match_key``).
 
@@ -119,41 +139,56 @@ def fixture_features(
     a division the model was never trained on has no history and is returned as all-NaN.
     """
     codes = div_codes if div_codes is not None else div_code_map(played)
+    if match_xg is not None:
+        # same xG attachment as build_feature_table: without it the xg form features of every
+        # fixture are NaN, which the xg model reads as a "pre-xG era" match (biased 1X2).
+        from fedge.features.xg import attach_xg
+
+        played = attach_xg(played, match_xg)
     by_div = {d: g for d, g in played.groupby("div", observed=True)}
     rows, keys = [], []
-    for f in fixtures.itertuples(index=False):
-        g = by_div.get(f.div)
+    # Fixtures of one division with the same kickoff and no team in common share one causal
+    # sweep: the sweeps release only rows with kickoff at least the embargo before the row being
+    # scored and a fixture (no result) never enters any state, so appending several such fixtures
+    # is identical to scoring them one at a time (tested), just much faster for a whole-season
+    # schedule. A team playing twice in one batch would see its own other fixture as a game in
+    # the schedule features (rest days 0), hence the team-disjoint chunks.
+    for (div, ko), grp in _disjoint_batches(fixtures):
+        g = by_div.get(div)
         if g is None:
             continue
-        before = g.loc[g["kickoff_utc"] < f.kickoff_utc]
-        row = {
-            "match_id": f.match_key,
-            "div": f.div,
-            "season": season_of(f.kickoff_utc),
-            "kickoff_utc": f.kickoff_utc,
-            "home": f.home,
-            "away": f.away,
-            "FTHG": np.nan,
-            "FTAG": np.nan,
-        }
-        sub = pd.concat([before, pd.DataFrame([row])], ignore_index=True)
+        before = g.loc[g["kickoff_utc"] < ko]
+        fx_rows = pd.DataFrame(
+            {
+                "match_id": grp["match_key"].to_numpy(),
+                "div": div,
+                "season": season_of(ko),
+                "kickoff_utc": ko,
+                "home": grp["home"].to_numpy(),
+                "away": grp["away"].to_numpy(),
+                "FTHG": np.nan,
+                "FTAG": np.nan,
+            }
+        )
+        sub = pd.concat([before, fx_rows], ignore_index=True)
         sub["kickoff_utc"] = pd.to_datetime(sub["kickoff_utc"], utc=True)
         # the ingest writes nullable Int64 goal columns; the rating sweeps cast to int64 and
         # pandas refuses that for an extension dtype holding NA, so coerce the goals to float64.
-        # The fixture's own (missing) goals are never released into any state: it is the last row
-        # and the sweeps only release rows strictly before the row being scored.
         for col in ("FTHG", "FTAG"):
             if col in sub.columns:
                 sub[col] = pd.to_numeric(sub[col], errors="coerce").astype(float)
-        s = sub.sort_values("kickoff_utc", kind="mergesort")
-        r = ratings.attack_defence_sweep(s)
-        r["elo_diff"] = ratings.elo_sweep(s, *ELO_PARAMS)
-        r["pi_diff"] = ratings.pi_sweep(s, *PI_PARAMS)
-        frow = form.form_features(s).loc[[f.match_key]]
-        last = pd.concat([r.iloc[[-1]].reset_index(drop=True), frow.reset_index(drop=True)], axis=1)
-        last["div_code"] = codes.get(f.div, np.nan)
+        s_ = sub.sort_values("kickoff_utc", kind="mergesort")
+        r = ratings.attack_defence_sweep(s_)
+        r["elo_diff"] = ratings.elo_sweep(s_, *ELO_PARAMS)
+        r["pi_diff"] = ratings.pi_sweep(s_, *PI_PARAMS)
+        n = len(fx_rows)
+        frows = form.form_features(s_).loc[list(grp["match_key"])]
+        last = pd.concat(
+            [r.iloc[-n:].reset_index(drop=True), frows.reset_index(drop=True)], axis=1
+        )
+        last["div_code"] = codes.get(div, np.nan)
         rows.append(last)
-        keys.append(f.match_key)
+        keys.extend(grp["match_key"])
     if not rows:
         return pd.DataFrame()
     out = pd.concat(rows, ignore_index=True)
@@ -312,7 +347,9 @@ def score_all(
     """
     feats = build_features(played, data_dir)
     table = training_table(played, feats, load_market_pre(data_dir))
-    x_fix = fixture_features(played, fixtures, div_code_map(played))
+    xg_file = Path(data_dir) / "interim" / "match_xg.parquet"
+    match_xg = pd.read_parquet(xg_file) if xg_file.exists() else None
+    x_fix = fixture_features(played, fixtures, div_code_map(played), match_xg)
     if x_fix.empty:
         return score_fixtures({}, x_fix, price_rows, weights)
     asof = fixtures["kickoff_utc"].min()
@@ -321,3 +358,70 @@ def score_all(
         model = str(strategy["markets"][market]["model"])
         fits[market] = fit_live(table, market, model, asof, threads=threads)
     return score_fixtures(fits, x_fix, price_rows, weights)
+
+
+PRICE_FREE_MODEL = "lgb_xg"  # best price-free 1X2 model in reports/v2_main.md (log loss 1.0103)
+FEATURE_HORIZON_DAYS = 7
+
+
+def feature_asof_fixtures(
+    fixtures: pd.DataFrame, now, played: pd.DataFrame, horizon_days: int = FEATURE_HORIZON_DAYS
+):
+    """Copy of ``fixtures`` with the *feature* kickoff of far-future matches moved forward only
+    as far as "the next matchday".
+
+    Rest days / games-in-window features depend on the kickoff of the fixture. For a match many
+    weeks away they would be computed against a gap with no matches played (rest = the 21-day
+    cap), which is nothing the model saw for a normal fixture. Fixtures within ``horizon_days``
+    of ``now`` keep their real kickoff; later ones are scored as if they kicked off
+    ``horizon_days`` after the division's latest played match, i.e. with today's ratings and form
+    and a normal one-week gap. The real kickoff is only used for display.
+    """
+    now = pd.Timestamp(now)
+    out = fixtures.copy()
+    last = played.groupby("div")["kickoff_utc"].max()
+    far = out["kickoff_utc"] > now + pd.Timedelta(days=horizon_days)
+    if far.any():
+        cap = out.loc[far, "div"].map(last) + pd.Timedelta(days=horizon_days)
+        # a division with no played match keeps its real date (and is skipped downstream)
+        out.loc[far, "kickoff_utc"] = cap.fillna(out.loc[far, "kickoff_utc"]).to_numpy()
+    out["kickoff_utc"] = pd.to_datetime(out["kickoff_utc"], utc=True)
+    return out
+
+
+def live_feature_columns(table_columns, model: str = PRICE_FREE_MODEL) -> list[str]:
+    """Feature columns in the exact order :func:`fit_live` trained the model with.
+
+    LightGBM's ``Booster.predict`` takes a DataFrame positionally, so scoring with the column
+    order of :func:`fixture_features` (ratings, form, ``div_code``) instead of the training order
+    silently scrambles the features.
+    """
+    _learner, variant, _decor = LIVE_MODELS[model]
+    return feature_sets(list(table_columns))[variant]
+
+
+def score_price_free(
+    data_dir, played: pd.DataFrame, fixtures: pd.DataFrame, now, threads: int = THREADS
+) -> pd.DataFrame:
+    """1X2 probabilities (``match_key`` x H/D/A) from the non-anchored ``lgb_xg`` model.
+
+    Used for fixtures that have no bookmaker price (weeks away). Features are the ratings and
+    form as of ``now`` (see :func:`feature_asof_fixtures`); the model sees no market feature, so
+    it is a longer-range estimate that will shift as results come in. Display-only.
+    """
+    cols = ["H", "D", "A"]
+    if fixtures.empty:
+        return pd.DataFrame(columns=cols)
+    feats = build_features(played, data_dir)
+    table = training_table(played, feats, load_market_pre(data_dir))
+    xg_file = Path(data_dir) / "interim" / "match_xg.parquet"
+    match_xg = pd.read_parquet(xg_file) if xg_file.exists() else None
+    x_fix = fixture_features(
+        played, feature_asof_fixtures(fixtures, now, played), div_code_map(played), match_xg
+    )
+    if x_fix.empty:
+        return pd.DataFrame(columns=cols)
+    learner, model_obj, cal, _info = fit_live(table, "1x2", PRICE_FREE_MODEL, now)
+    x_fix = x_fix[live_feature_columns(table.columns, PRICE_FREE_MODEL)]
+    raw = gbm.predict_model(model_obj, learner, "1x2", x_fix, None)
+    return pd.DataFrame(cal(raw), index=x_fix.index, columns=cols)

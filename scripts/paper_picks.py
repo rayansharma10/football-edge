@@ -27,6 +27,7 @@ placed, and **nothing** otherwise. Errors exit non-zero with a single line on st
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
 from pathlib import Path
 
@@ -77,12 +78,20 @@ def _refresh_predictions(args, edges, fixtures, played, now) -> None:
     """Best-effort 'Upcoming predictions' refresh (stderr only; never affects bets or stdout)."""
     try:
         divs = load_desk_divs(args.leagues)
-        rows = pred.build_rows(edges, fixtures, played, now, now, desk_divs=divs)
+        # model chatter (feature build, fit logs) must stay off stdout: the digest is stdout-only
+        with contextlib.redirect_stdout(sys.stderr):
+            rows, meta, res = pred.build_all(
+                args.data_dir, played, fixtures, edges, now, divs,
+                refresh=not args.cached_fixtures, delay=args.delay,
+            )
         conn = ledger.connect(ledger.default_path(args.data_dir))
-        n = pred.write_predictions(conn, rows)
+        n = pred.write_predictions(conn, rows, meta)
         modelled = sum(r["status"] == "modelled" for r in rows)
-        print(f"paper_picks: predictions table refreshed: {n} rows ({modelled} modelled)",
-              file=sys.stderr)
+        free = sum(r["model_kind"] == pred.KIND_PRICE_FREE for r in rows)
+        print(f"paper_picks: predictions table refreshed: {n} rows ({modelled} modelled, "
+              f"{free} price-free)", file=sys.stderr)
+        for w in res.warnings + [f"UNMAPPED team name: {u}" for u in res.unmapped]:
+            print(f"paper_picks: schedule: {w}", file=sys.stderr)
     except Exception as exc:  # noqa: BLE001 - display-only feature must not fail the picks run
         print(f"paper_picks: predictions refresh skipped: {type(exc).__name__}: {exc}",
               file=sys.stderr)

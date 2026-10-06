@@ -47,11 +47,40 @@ whose grid reproduces the target home/away probabilities (`scipy.optimize.root`)
 converge - or to remove the last of the numerical error - the grid is rescaled by outcome class (IPF)
 so the 1X2 matches the model exactly. The predicted score and the goal markets are therefore a model
 estimate, not a market price. `/api/predictions` returns the model fields only (`probs`, `xg`,
-`top_scores`, `p_over25`, `p_btts`, `detail`); the de-vigged price columns and the grid stay in the
+`top_scores`, `p_over25`, `p_btts`, `long_range`, plus a `schedule` block); the de-vigged price columns and the grid stay in the
 `predictions` table and are not served. Two ways to run it by hand:
 
     uv run python scripts/predict_upcoming.py --home Arsenal --away Chelsea   # single-match lookup
     uv run python scripts/predict_upcoming.py --dry-run --json                # print, write nothing
+
+#### Whole-season schedule and the price-free model
+
+football-data's `fixtures.csv` only carries the next few days (and often no E0/SP1 rows at all), so the
+panel lists **every remaining match of the season** from a full schedule (`src/fedge/ingest/schedule.py`):
+
+1. **fixturedownload.com** JSON feed (primary; free, no key, UTC kickoffs),
+2. **openfootball** `football.json` on GitHub (fallback; free, no key),
+3. the **last good cache** in `data/raw/schedule/` (flagged STALE on the page when both fail).
+
+No API key is needed. (football-data.org's free tier would work with `FOOTBALL_DATA_ORG_KEY`, 10 req/min, but is not required.)
+The schedule is re-fetched on every `predict_upcoming.py` / `paper_picks.py` run (`--no-refresh-schedule` /
+`--cached-fixtures` reuse the cache). Team names are mapped to the football-data names used by the rest of the repo
+via `config/team_aliases.csv` plus `config/schedule_aliases.csv`; an unmapped name is logged at ERROR level,
+printed to stderr and its fixtures are dropped (add the alias and re-run). football-data's `fixtures.csv` stays the
+source of bookmaker prices: a fixture that has a complete price replaces its schedule twin.
+
+Two 1X2 methods, stored per row in `predictions.model_kind`:
+
+* `lgbd_xg_priced` - fixtures with a price: the market-anchored `lgbd_xg` (unchanged).
+* `lgb_xg_price_free` - everything else (weeks away): the non-anchored `lgb_xg` (best price-free 1X2 model in
+  `reports/v2_main.md`, log loss 1.0103 vs Elo 1.0164, Dixon-Coles 1.0273), fed the ratings and form **as of today**
+  with no market feature. Rest-day features for a far-future match are computed as if it kicked off a week after the
+  division's latest played match. These rows carry a subtle *longer-range estimate* note on the page and **will shift
+  as results come in**. The scoreline is still the Dixon-Coles grid reconciled to that 1X2 (`predict_match`).
+
+The page has no date cut-off: league chips (all / Premier League / La Liga), a *Next 7 days / Whole season* toggle,
+fixtures grouped by day with 10 days shown at a time and a *Show more* button. This is display-only: shadow bets are
+still only placed for fixtures with real prices, and the picks digest on stdout is unchanged.
 
 The same refresh runs at the end of `scripts/paper_picks.py` (after the digest, stderr only, failures
 never fail the picks job). Fixtures in other divisions are not scored and not shown; the scoring

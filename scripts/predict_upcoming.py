@@ -46,6 +46,10 @@ def parse_args(argv=None):
         "--fixtures-csv",
         help="read the fixture list from this file instead of downloading (testing/staging)",
     )
+    ap.add_argument(
+        "--no-refresh-schedule", action="store_true",
+        help="use the cached full-season schedule instead of re-downloading it",
+    )
     ap.add_argument("--dry-run", action="store_true", help="score and print, write nothing")
     ap.add_argument("--json", action="store_true", help="print the rows as JSON (with --dry-run)")
     ap.add_argument("--home", help="single-match lookup: home team name (as in the data)")
@@ -80,11 +84,14 @@ def print_rows(rows, as_json: bool) -> None:
             continue
         d = json.loads(r["detail"])
         top = json.loads(r["top_scores"])
+        mkt = "   [price-free estimate]" if r["mkt_home"] is None else (
+            f"   market {r['mkt_home'] * 100:5.1f}% / {r['mkt_draw'] * 100:5.1f}% / "
+            f"{r['mkt_away'] * 100:5.1f}%"
+        )
         print(
             f"{head}\n"
             f"    1X2 {r['p_home'] * 100:5.1f}% / {r['p_draw'] * 100:5.1f}% / "
-            f"{r['p_away'] * 100:5.1f}%   market {r['mkt_home'] * 100:5.1f}% / "
-            f"{r['mkt_draw'] * 100:5.1f}% / {r['mkt_away'] * 100:5.1f}%\n"
+            f"{r['p_away'] * 100:5.1f}%{mkt}\n"
             f"    xG {r['xg_home']:.2f} - {r['xg_away']:.2f}   O2.5 {r['p_over25'] * 100:.1f}%   "
             f"BTTS {r['p_btts'] * 100:.1f}%\n"
             f"    top scores {', '.join(f'{t['score']} {t['p'] * 100:.1f}%' for t in top)}\n"
@@ -197,12 +204,22 @@ def main(argv=None) -> int:
             args.data_dir, strategy, played, upcoming, rows_up,
             picks.pool_weights(strategy), threads=args.threads,
         )
-    built = pred.build_rows(edges, desk, played, now, now, desk_divs=divs)
+    built, meta, res = pred.build_all(
+        args.data_dir, played, desk, edges, now, divs,
+        refresh=not args.cached_fixtures and not args.no_refresh_schedule,
+        delay=args.delay, threads=args.threads,
+    )
     print_rows(built, args.json)
+    for w in res.warnings + [f"UNMAPPED team name: {u}" for u in res.unmapped]:
+        print(f"predict_upcoming: schedule: {w}", file=sys.stderr)
     n_mod = sum(r["status"] == "modelled" for r in built)
+    n_free = sum(r.get("model_kind") == pred.KIND_PRICE_FREE for r in built)
+    by_div = {d: sum(r["div"] == d for r in built) for d in divs}
     print(
-        f"predict_upcoming: {len(built)} upcoming fixtures in {list(divs)} "
-        f"({n_mod} modelled, {len(built) - n_mod} not modelled)",
+        f"predict_upcoming: {len(built)} upcoming fixtures in {list(divs)} {by_div} "
+        f"({n_mod} modelled: {n_mod - n_free} priced lgbd_xg + {n_free} price-free lgb_xg, "
+        f"{len(built) - n_mod} not modelled); schedule sources {res.sources}"
+        + (" STALE" if res.stale else ""),
         file=sys.stderr,
     )
     if args.dry_run:
@@ -210,7 +227,7 @@ def main(argv=None) -> int:
     if not built:
         return 0
     conn = ledger.connect(ledger.default_path(args.data_dir))
-    n = pred.write_predictions(conn, built)
+    n = pred.write_predictions(conn, built, meta)
     print(f"predict_upcoming: wrote {n} rows to predictions", file=sys.stderr)
     return 0
 

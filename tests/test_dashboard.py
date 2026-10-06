@@ -123,3 +123,34 @@ def test_main_page_is_model_only_and_the_ledger_holds_the_book(tmp_path):
         assert banned not in home, f"main page should not mention {banned!r}"
     ledger = c.get("/ledger").text
     assert "Edge" in ledger and "CLV" in ledger
+
+
+def test_predictions_api_has_no_date_cutoff_and_flags_long_range(tmp_path):
+    """A match months away is returned, flagged long_range; stale schedule warnings surface."""
+    from fedge.predict import upcoming as pred
+
+    root = _root(tmp_path)
+    conn = ledger.connect(root / "data" / "paper.sqlite")
+
+    def row(key, ko, kind):
+        return {
+            "match_key": key, "run_ts": "2026-10-06T00:00:00+00:00", "status": "modelled",
+            "div": "SP1", "league": "Spain La Liga", "home": "Getafe", "away": "Elche",
+            "kickoff_utc": ko, "p_home": 0.4, "p_draw": 0.3, "p_away": 0.3,
+            "xg_home": 1.3, "xg_away": 1.1, "p_over25": 0.5, "p_btts": 0.5,
+            "top_scores": '[{"score": "1-1", "p": 0.12}]', "detail": "{}", "model_kind": kind,
+        }
+
+    pred.write_predictions(
+        conn,
+        [row("near", "2026-10-09T19:00:00+00:00", pred.KIND_PRICED),
+         row("far", "2027-05-30T19:00:00+00:00", pred.KIND_PRICE_FREE)],
+        {"schedule_stale": "1", "schedule_warnings": '["E0: using cached schedule"]',
+         "schedule_fetched_utc": "2026-10-05T00:00:00+00:00"},
+    )
+    got = TestClient(create_app(root)).get("/api/predictions").json()
+    by = {r["match_key"]: r for r in got["rows"]}
+    assert set(by) == {"near", "far"}
+    assert by["far"]["long_range"] is True and by["near"]["long_range"] is False
+    assert got["schedule"]["stale"] is True and got["schedule"]["warnings"]
+    assert "mkt_home" not in by["far"] and "market" not in by["far"]

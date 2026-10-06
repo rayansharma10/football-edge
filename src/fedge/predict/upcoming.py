@@ -56,15 +56,20 @@ CREATE TABLE IF NOT EXISTS predictions (
     p_over25     REAL, p_btts REAL,
     top_scores   TEXT,                   -- JSON [{score,p}, ...] (top 5)
     grid         TEXT,                   -- JSON 6x6, rows = home goals 0-5
-    detail       TEXT                    -- JSON: method, lambdas, DC 1X2, fallback flags
+    detail       TEXT,                   -- JSON: method, lambdas, DC 1X2, fallback flags
+    model_kind   TEXT                    -- 'lgbd_xg_priced' | 'lgb_xg_price_free'
 );
 CREATE INDEX IF NOT EXISTS predictions_kickoff ON predictions (kickoff_utc);
+CREATE TABLE IF NOT EXISTS prediction_meta (key TEXT PRIMARY KEY, value TEXT);
 """
+
+KIND_PRICED = "lgbd_xg_priced"
+KIND_PRICE_FREE = "lgb_xg_price_free"
 
 COLS = [
     "match_key", "run_ts", "status", "reason", "div", "league", "home", "away", "kickoff_utc",
     "p_home", "p_draw", "p_away", "mkt_home", "mkt_draw", "mkt_away", "xg_home", "xg_away",
-    "p_over25", "p_btts", "top_scores", "grid", "detail",
+    "p_over25", "p_btts", "top_scores", "grid", "detail", "model_kind",
 ]
 
 
@@ -109,7 +114,7 @@ def _target_frames(edges: pd.DataFrame):
     return model, mkt
 
 
-def _modelled_row(f, tgt, mk, params, played, now, run_ts) -> dict:
+def _modelled_row(f, tgt, mk, params, played, now, run_ts, kind=KIND_PRICED) -> dict:
     fallback = None
     if params is None:
         lh, la = _league_means(played, f.div, now)
@@ -129,19 +134,26 @@ def _modelled_row(f, tgt, mk, params, played, now, run_ts) -> dict:
         "dc_1x2": pm["dc_p"],
         "fallback": fallback,
         "grid_mass_shown": pm["grid_mass_shown"],
-        "model": "lgbd_xg (market-anchored: initialised from the de-margined price)",
+        "model": (
+            "lgbd_xg (market-anchored: initialised from the de-margined price)"
+            if kind == KIND_PRICED
+            else "lgb_xg (price-free: no market feature; today's ratings and form)"
+        ),
     }
     return {
         "match_key": f.match_key, "run_ts": _iso(run_ts), "status": "modelled", "reason": None,
         "div": f.div, "league": DIV_NAMES.get(f.div, f.div), "home": f.home, "away": f.away,
         "kickoff_utc": _iso(f.kickoff_utc),
         "p_home": pm["p_home"], "p_draw": pm["p_draw"], "p_away": pm["p_away"],
-        "mkt_home": float(mk[0]), "mkt_draw": float(mk[1]), "mkt_away": float(mk[2]),
+        "mkt_home": None if mk is None else float(mk[0]),
+        "mkt_draw": None if mk is None else float(mk[1]),
+        "mkt_away": None if mk is None else float(mk[2]),
         "xg_home": pm["xg_home"], "xg_away": pm["xg_away"],
         "p_over25": pm["p_over25"], "p_btts": pm["p_btts"],
         "top_scores": json.dumps([{"score": t["score"], "p": t["p"]} for t in pm["top_scores"]]),
         "grid": json.dumps(pm["grid"]),
         "detail": json.dumps(detail),
+        "model_kind": kind,
     }
 
 
@@ -159,13 +171,16 @@ def build_rows(
     run_ts,
     now=None,
     desk_divs=DESK_DIVS,
+    price_free: pd.DataFrame | None = None,
 ) -> list[dict]:
     """One dict per upcoming desk-league fixture (Premier League + La Liga only).
 
     ``edges`` is the output of :func:`fedge.paper.model_state.score_all` (only its 1x2 rows are
-    used); ``fixtures`` every parsed fixture. Other divisions are dropped entirely; a desk
-    fixture that could not be scored (no complete price) is kept as a ``not_modelled`` row so
-    it is never silently missing.
+    used); ``fixtures`` every known fixture (priced or schedule-only). ``price_free`` is an
+    optional ``match_key`` x H/D/A frame of price-free 1X2 probabilities for fixtures that have no
+    price: those become ``lgb_xg_price_free`` rows. Other divisions are dropped entirely; a desk
+    fixture with neither a price nor a price-free estimate is kept as a ``not_modelled`` row so it
+    is never silently missing.
     """
     run_ts = _utc(run_ts)
     now = _utc(now) if now is not None else run_ts
@@ -175,34 +190,101 @@ def build_rows(
         model_p, mkt_p = _target_frames(edges)
     else:
         model_p = mkt_p = pd.DataFrame()
-    todo = (
-        fixtures.loc[fixtures["match_key"].isin(model_p.index) & (fixtures["kickoff_utc"] > now)]
-        if len(model_p) else fixtures.iloc[0:0]
+    pf = price_free if price_free is not None else pd.DataFrame()
+    future = fixtures.loc[fixtures["kickoff_utc"] > now]
+    priced = (
+        future.loc[future["match_key"].isin(model_p.index)] if len(model_p) else future.iloc[0:0]
     )
+    free = future.loc[
+        ~future["match_key"].isin(set(priced["match_key"])) & future["match_key"].isin(pf.index)
+    ]
+    todo = pd.concat([priced, free])
     fits = fit_divisions(played, todo["div"], now) if len(todo) else {}
-    for f in todo.itertuples(index=False):
+    for f in priced.itertuples(index=False):
         tgt = model_p.loc[f.match_key, ["H", "D", "A"]].to_numpy(dtype=float)
         mk = mkt_p.loc[f.match_key, ["H", "D", "A"]].to_numpy(dtype=float)
         rows.append(_modelled_row(f, tgt, mk, fits.get(f.div), played, now, run_ts))
+    for f in free.itertuples(index=False):
+        tgt = pf.loc[f.match_key, ["H", "D", "A"]].to_numpy(dtype=float)
+        rows.append(
+            _modelled_row(f, tgt, None, fits.get(f.div), played, now, run_ts, KIND_PRICE_FREE)
+        )
     done = {r["match_key"] for r in rows}
-    for f in fixtures.itertuples(index=False):
-        if f.match_key in done or _utc(f.kickoff_utc) <= now:
+    for f in future.itertuples(index=False):
+        if f.match_key in done:
             continue
         rows.append(_unmodelled(
             f.match_key, run_ts, f.div, DIV_NAMES.get(f.div, f.div), f.home, f.away,
-            f.kickoff_utc, "no complete 1X2 price in the fixture file",
+            f.kickoff_utc, "no price and no price-free estimate",
         ))
     rows.sort(key=lambda r: (r["kickoff_utc"], r["home"]))
     return rows
 
 
+def full_fixture_list(priced_fixtures: pd.DataFrame, data_dir, divs, now, refresh=True, delay=1.0):
+    """Schedule-backed fixture list: ``(fixtures, ScheduleResult)``.
+
+    The full-season schedule (:mod:`fedge.ingest.schedule`) with football-data's priced fixtures
+    merged over it. Never raises: when no schedule is available the priced fixtures stand alone.
+    """
+    from fedge.ingest import schedule as sch
+
+    try:
+        res = sch.load_schedule(tuple(divs), data_dir, now=now, refresh=refresh, delay=delay)
+    except Exception as exc:  # defensive: the picks run must not fail on a display feature
+        res = sch.ScheduleResult(
+            fixtures=pd.DataFrame(columns=sch.COLUMNS), stale=True,
+            warnings=[f"schedule unavailable ({type(exc).__name__}: {exc})"],
+        )
+    desk_priced = priced_fixtures.loc[priced_fixtures["div"].isin(set(map(str, divs)))]
+    sched_fx = sch.to_fixtures(sch.upcoming(res.fixtures, now))
+    return sch.merge_priced(sched_fx, desk_priced), res
+
+
+def score_missing_prices(
+    data_dir, played, fixtures, edges, now, divs, threads=None
+) -> pd.DataFrame:
+    """Price-free 1X2 for upcoming desk fixtures that have no priced edge (best effort)."""
+    from fedge.paper import model_state as ms
+
+    have = set(edges.loc[edges["market"] == "1x2", "match_key"]) if len(edges) else set()
+    miss = fixtures.loc[
+        fixtures["div"].isin(set(map(str, divs)))
+        & (fixtures["kickoff_utc"] > _utc(now))
+        & ~fixtures["match_key"].isin(have)
+    ]
+    if miss.empty:
+        return pd.DataFrame(columns=["H", "D", "A"])
+    return ms.score_price_free(data_dir, played, miss, now, threads or ms.THREADS)
+
+
+def build_all(
+    data_dir, played, priced_fixtures, edges, now, divs, refresh=True, delay=1.0, threads=None
+):
+    """Whole display pipeline: ``(rows, meta, schedule_result)``.
+
+    Full-season schedule + priced fixtures -> priced rows from ``edges`` (lgbd_xg) and price-free
+    rows (lgb_xg) for every other upcoming fixture. Nothing here touches bets or stdout.
+    """
+    fixtures, res = full_fixture_list(priced_fixtures, data_dir, divs, now, refresh, delay)
+    price_free = score_missing_prices(data_dir, played, fixtures, edges, now, divs, threads)
+    rows = build_rows(edges, fixtures, played, now, now, desk_divs=divs, price_free=price_free)
+    return rows, res.meta, res
+
+
 def ensure_table(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    have = {r[1] for r in conn.execute("PRAGMA table_info(predictions)")}
+    if "model_kind" not in have:  # table created by an older version
+        conn.execute("ALTER TABLE predictions ADD COLUMN model_kind TEXT")
 
 
-def write_predictions(conn: sqlite3.Connection, rows: list[dict]) -> int:
+def write_predictions(
+    conn: sqlite3.Connection, rows: list[dict], meta: dict[str, str] | None = None
+) -> int:
     """Replace the table contents with ``rows`` in one transaction (the set of upcoming
-    fixtures changes every run, so stale rows must go)."""
+    fixtures changes every run, so stale rows must go). ``meta`` (schedule source, staleness,
+    warnings) replaces ``prediction_meta`` when given."""
     ensure_table(conn)
     with conn:
         conn.execute("DELETE FROM predictions WHERE 1=1")
@@ -211,4 +293,9 @@ def write_predictions(conn: sqlite3.Connection, rows: list[dict]) -> int:
             f"VALUES ({','.join('?' * len(COLS))})",
             [tuple(r.get(c) for c in COLS) for r in rows],
         )
+        if meta is not None:
+            conn.execute("DELETE FROM prediction_meta WHERE 1=1")
+            conn.executemany(
+                "INSERT INTO prediction_meta (key, value) VALUES (?, ?)", list(meta.items())
+            )
     return len(rows)

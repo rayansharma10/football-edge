@@ -120,3 +120,22 @@ canvas{ display:block; width:100%; background:var(--card); border-radius:8px; }
 .legend{ color:var(--mute); font-size:13px; margin-top:8px; }
 
 footer{ margin-top:36px; color:var(--mute); font-size:13px; border-top:1px solid var(--line); padding-top:14px; }
+
+/* ------------------------------------------------------------------ filters / long range */
+.controls{ display:flex; flex-wrap:wrap; justify-content:space-between; row-gap:10px; column-gap:24px; margin:14px 0 4px; }
+.chips{ display:flex; flex-wrap:wrap; row-gap:8px; column-gap:8px; }
+.fchip, .more button{
+  font:inherit; font-size:13px; font-weight:550; cursor:pointer;
+  background:var(--card); color:var(--ink); border:1px solid var(--line);
+  border-radius:999px; padding:4px 13px;
+}
+.fchip.on{ background:var(--accent); border-color:var(--accent); color:#fff; }
+.fchip:hover:not(.on), .more button:hover{ border-color:var(--accent); }
+.more{ text-align:center; padding:6px 0 26px; font-size:13px; }
+.lr, .lr-note{ color:var(--mute); font-style:italic; }
+.lr-note{ font-size:12px; margin-top:8px; }
+.notice{
+  margin:12px 0 0; padding:9px 14px; border-radius:10px; font-size:13px;
+  background:var(--chip); color:var(--ink); border:1px solid var(--line);
+}
+.controls[hidden]{ display:none; }

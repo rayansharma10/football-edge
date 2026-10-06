@@ -1,0 +1,61 @@
+source,div,name,football_data
+fixturedownload,E0,Man Utd,Man United
+fixturedownload,E0,Spurs,Tottenham
+fixturedownload,SP1,Athletic Club,Ath Bilbao
+fixturedownload,SP1,Atlético de Madrid,Ath Madrid
+fixturedownload,SP1,CA Osasuna,Osasuna
+fixturedownload,SP1,Deportivo Alavés,Alaves
+fixturedownload,SP1,Elche CF,Elche
+fixturedownload,SP1,FC Barcelona,Barcelona
+fixturedownload,SP1,Getafe CF,Getafe
+fixturedownload,SP1,Levante UD,Levante
+fixturedownload,SP1,Málaga CF,Malaga
+fixturedownload,SP1,R. Racing Club,Santander
+fixturedownload,SP1,RC Deportivo,La Coruna
+fixturedownload,SP1,RCD Espanyol de Barcelona,Espanol
+fixturedownload,SP1,Rayo Vallecano,Vallecano
+fixturedownload,SP1,Real Betis,Betis
+fixturedownload,SP1,Real Sociedad,Sociedad
+fixturedownload,SP1,Sevilla FC,Sevilla
+fixturedownload,SP1,Valencia CF,Valencia
+fixturedownload,SP1,Villarreal CF,Villarreal
+openfootball,E0,AFC Bournemouth,Bournemouth
+openfootball,E0,Arsenal FC,Arsenal
+openfootball,E0,Aston Villa FC,Aston Villa
+openfootball,E0,Brentford FC,Brentford
+openfootball,E0,Brighton & Hove Albion FC,Brighton
+openfootball,E0,Chelsea FC,Chelsea
+openfootball,E0,Coventry City FC,Coventry
+openfootball,E0,Crystal Palace FC,Crystal Palace
+openfootball,E0,Everton FC,Everton
+openfootball,E0,Fulham FC,Fulham
+openfootball,E0,Hull City AFC,Hull
+openfootball,E0,Ipswich Town FC,Ipswich
+openfootball,E0,Leeds United FC,Leeds
+openfootball,E0,Liverpool FC,Liverpool
+openfootball,E0,Manchester City FC,Man City
+openfootball,E0,Manchester United FC,Man United
+openfootball,E0,Newcastle United FC,Newcastle
+openfootball,E0,Nottingham Forest FC,Nott'm Forest
+openfootball,E0,Sunderland AFC,Sunderland
+openfootball,E0,Tottenham Hotspur FC,Tottenham
+openfootball,SP1,Athletic Club,Ath Bilbao
+openfootball,SP1,CA Osasuna,Osasuna
+openfootball,SP1,Club Atlético de Madrid,Ath Madrid
+openfootball,SP1,Deportivo Alavés,Alaves
+openfootball,SP1,Elche CF,Elche
+openfootball,SP1,FC Barcelona,Barcelona
+openfootball,SP1,Getafe CF,Getafe
+openfootball,SP1,Levante UD,Levante
+openfootball,SP1,Málaga CF,Malaga
+openfootball,SP1,RC Celta de Vigo,Celta
+openfootball,SP1,RC Deportivo La Coruña,La Coruna
+openfootball,SP1,RCD Espanyol de Barcelona,Espanol
+openfootball,SP1,Rayo Vallecano de Madrid,Vallecano
+openfootball,SP1,Real Betis Balompié,Betis
+openfootball,SP1,Real Madrid CF,Real Madrid
+openfootball,SP1,Real Racing Club de Santander,Santander
+openfootball,SP1,Real Sociedad de Fútbol,Sociedad
+openfootball,SP1,Sevilla FC,Sevilla
+openfootball,SP1,Valencia CF,Valencia
+openfootball,SP1,Villarreal CF,Villarreal

@@ -260,6 +260,8 @@ def create_app(root: Path | str = ROOT) -> FastAPI:
                 c,
                 "SELECT * FROM predictions ORDER BY kickoff_utc, home",
             )
+            meta = {m["key"]: m["value"]
+                    for m in _rows(c, "SELECT key, value FROM prediction_meta")}
         finally:
             if c:
                 c.close()
@@ -270,10 +272,9 @@ def create_app(root: Path | str = ROOT) -> FastAPI:
             ko = _parse(r["kickoff_utc"])
             last = max(last, r["run_ts"]) if last else r["run_ts"]
             try:
-                detail = json.loads(r["detail"]) if r["detail"] else {}
                 top = json.loads(r["top_scores"]) if r["top_scores"] else []
             except ValueError:
-                detail, top = {}, []
+                top = []
             # Model output only: the market/price columns and the scoreline grid are deliberately
             # not exposed, because the dashboard shows the model alone (no bookmaker odds).
             out.append(
@@ -298,15 +299,26 @@ def create_app(root: Path | str = ROOT) -> FastAPI:
                     "p_over25": r["p_over25"],
                     "p_btts": r["p_btts"],
                     "top_scores": top,
-                    "detail": detail,
+                    # no price existed for this match: a longer-range model estimate
+                    "long_range": r.get("model_kind") == "lgb_xg_price_free",
                 }
             )
         age = None
         if last:
             d = _parse(last)
             age = None if d is None else (datetime.now(UTC) - d).total_seconds() / 3600
+        try:
+            warns = json.loads(meta.get("schedule_warnings") or "[]")
+        except ValueError:
+            warns = []
+        sched_stale = meta.get("schedule_stale") == "1"
         return {
             "rows": out,
+            "schedule": {
+                "fetched_utc": meta.get("schedule_fetched_utc") or None,
+                "stale": sched_stale,
+                "warnings": warns if sched_stale else [],
+            },
             "last_updated_utc": last,
             "age_hours": None if age is None else round(age, 1),
             "stale_after_hours": PREDICTIONS_STALE_HOURS,
