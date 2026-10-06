@@ -170,10 +170,20 @@ def build_dataset(
         }
     )
     out: dict[str, pd.DataFrame] = {}
+    ids_by_cell = {
+        (d, str(s)): set(g["match_id"])
+        for (d, s), g in played.groupby(["div", "season"], observed=True)
+    }
     for market in SELS:
         mkt_parts, book_parts = [], []
         for r in refs[refs["market"] == market].itertuples(index=False):
             w = _wide(odds, r.book, r.market, r.phase)
+            if w.empty:
+                continue
+            # keep only this division-season's matches: every cell has its own reference book,
+            # and concatenating whole-book tables would let the first cell's book win everywhere
+            # (it silently dropped 2025/26+, where the reference is Betfair Exchange, not PS)
+            w = w.loc[w.index.intersection(ids_by_cell[(r.div, str(r.season))])]
             if w.empty:
                 continue
             mkt_parts.append(_devig(w, market, r.phase))
@@ -182,8 +192,11 @@ def build_dataset(
             )
         if not mkt_parts:
             continue
-        mkt = pd.concat(mkt_parts, axis=1)
-        mkt = mkt.loc[:, ~mkt.columns.duplicated()]
+        mkt = pd.concat(
+            [pd.concat([p for p in mkt_parts if p.columns[0].startswith(f"{ph}_")])
+             for ph in PHASES],
+            axis=1,
+        )
         books = None
         for part in book_parts:  # parts cover disjoint match sets (one book per div-season-phase)
             books = part if books is None else books.combine_first(part)
@@ -200,6 +213,12 @@ def build_dataset(
 
 # ------------------------------------------------------------------ metrics
 def model_cols(model: str, market: str) -> list[str]:
+    """Probability columns of ``model``; unknown names are ``<model>_h/_d/_a`` or ``_over/_under``
+    (the Phase 4 models, :mod:`scripts.run_main`, register their columns that way)."""
+    known = MODELS_1X2 if market == "1x2" else MODELS_OU
+    if model not in known:
+        sels = ("h", "d", "a") if market == "1x2" else ("over", "under")
+        return [f"{model}_{s}" for s in sels]
     if market == "1x2":
         return {
             "dc": ["dc_h", "dc_d", "dc_a"],

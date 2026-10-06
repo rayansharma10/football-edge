@@ -335,6 +335,7 @@ dependencies = [
     { name = "python-dotenv" },
     { name = "requests" },
     { name = "scikit-learn" },
+    { name = "venn-abers" },
 ]
 
 [package.dev-dependencies]
@@ -359,6 +360,7 @@ requires-dist = [
     { name = "python-dotenv" },
     { name = "requests" },
     { name = "scikit-learn" },
+    { name = "venn-abers", specifier = ">=1.5.4" },
 ]
 
 [package.metadata.requires-dev]
@@ -1505,6 +1507,17 @@ sdist = { url = "https://files.pythonhosted.org/packages/e3/05/b17359e1cefb4f909
 wheels = [
     { url = "https://files.pythonhosted.org/packages/92/9d/c4e665119135114480843e7ab388fa94d8480650450e6f8e26b70d323a4c/urllib3-2.8.0-py3-none-any.whl", hash = "sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3", size = 135717, upload-time = "2026-09-15T19:29:34.577Z" },
 ]
+
+[[package]]
+name = "venn-abers"
+version = "1.5.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "scikit-learn" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cb/30/3988e57974170121201bf1e21815c9ee30e605d0661369a9fad7aa732165/venn_abers-1.5.4.tar.gz", hash = "sha256:a6bf5383e618ce42d0ecb2335bba0d6b104ecbe979041f10019b57572364bc69", size = 20808, upload-time = "2026-08-12T04:57:37.42Z" }
 
 [[package]]
 name = "wcwidth"

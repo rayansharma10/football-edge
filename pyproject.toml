@@ -19,6 +19,7 @@ dependencies = [
     "python-dotenv",
     "requests",
     "matplotlib",
+    "venn-abers>=1.5.4",
 ]
 
 [dependency-groups]

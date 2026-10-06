@@ -149,6 +149,58 @@ def pi_sweep(
     return out
 
 
+# --------------------------------------------------------------------------- attack / defence
+AD_LR = 0.06  # fixed a priori (not tuned): online Poisson step size
+AD_MU_LR = 0.01
+AD_CLIP = 1.5
+AD_COLS = ("ad_att_h", "ad_def_h", "ad_att_a", "ad_def_a", "ad_lam_h", "ad_lam_a")
+
+
+def attack_defence_sweep(
+    matches: pd.DataFrame, lr: float = AD_LR, embargo=EMBARGO
+) -> pd.DataFrame:
+    """Pre-match online Poisson attack/defence ratings ("DC-lite"), one row per match.
+
+    ``lam_home = mu_h * exp(att_home + def_away)``, ``lam_away = mu_a * exp(att_away +
+    def_home)`` where ``def`` is a concession tendency (higher = leakier). Each released match
+    takes one stochastic-gradient step on the Poisson log-likelihood. The full Dixon-Coles
+    model (:mod:`fedge.models.dixon_coles`) is the comparison baseline; it is not used as a
+    feature because its walk-forward predictions only exist from the first test season.
+    ``matches``: one division, sorted by kickoff, played matches only (same contract as
+    :func:`elo_sweep`). Release rule is the strict ``available_at < bet_time`` of ``asof``.
+    """
+    ko = _utc_naive(matches["kickoff_utc"])
+    cut = ko - embargo.to_timedelta64()
+    home = matches["home"].to_numpy()
+    away = matches["away"].to_numpy()
+    gh = matches["FTHG"].to_numpy(dtype=float)
+    ga = matches["FTAG"].to_numpy(dtype=float)
+    att: dict[str, float] = {}
+    dfn: dict[str, float] = {}
+    mu_h, mu_a = 1.5, 1.2
+    out = np.empty((len(matches), len(AD_COLS)), dtype=float)
+    ptr = 0
+    for i in range(len(matches)):
+        while ptr < i and ko[ptr] < cut[i]:
+            h, a = home[ptr], away[ptr]
+            lam_h = mu_h * np.exp(att.get(h, 0.0) + dfn.get(a, 0.0))
+            lam_a = mu_a * np.exp(att.get(a, 0.0) + dfn.get(h, 0.0))
+            eh, ea = gh[ptr] - lam_h, ga[ptr] - lam_a
+            clip = lambda v: float(np.clip(v, -AD_CLIP, AD_CLIP))  # noqa: E731
+            att[h] = clip(att.get(h, 0.0) + lr * eh)
+            dfn[a] = clip(dfn.get(a, 0.0) + lr * eh)
+            att[a] = clip(att.get(a, 0.0) + lr * ea)
+            dfn[h] = clip(dfn.get(h, 0.0) + lr * ea)
+            mu_h += AD_MU_LR * (gh[ptr] - mu_h)
+            mu_a += AD_MU_LR * (ga[ptr] - mu_a)
+            ptr += 1
+        h, a = home[i], away[i]
+        ah, dh = att.get(h, 0.0), dfn.get(h, 0.0)
+        aa, da = att.get(a, 0.0), dfn.get(a, 0.0)
+        out[i] = (ah, dh, aa, da, mu_h * np.exp(ah + da), mu_a * np.exp(aa + dh))
+    return pd.DataFrame(out, columns=list(AD_COLS), index=matches["match_id"].to_numpy())
+
+
 # --------------------------------------------------------------------------- ordered logit
 @dataclass(frozen=True)
 class OrderedLogit:
