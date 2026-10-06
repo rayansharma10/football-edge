@@ -4,7 +4,7 @@ Design (Phase 3, card 3.2):
 
 * **Causal sweeps.** Both ratings are computed once per division with a single chronological
   sweep (:func:`elo_sweep`, :func:`pi_sweep`). A match's result enters the state only once
-  ``kickoff + EMBARGO <= kickoff_of_the_match_being_predicted``, i.e. the same 3h rule
+  ``kickoff + EMBARGO < kickoff_of_the_match_being_predicted``, i.e. the same 3h rule
   :mod:`fedge.backtest.walkforward` uses for folds and the same
   ``available_at < bet_time`` discipline as :mod:`fedge.features.asof` (a result's
   ``available_at`` is ``kickoff + 3h``). ``tests/test_ratings.py`` proves the sweep equals a

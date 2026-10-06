@@ -32,11 +32,13 @@ REPORTS = ROOT / "reports"
 CONFIG = ROOT / "config"
 N_BOOT = 1000
 N_RAND = 200
-SCENARIOS = (
-    "exch",
-    "max",
-)  # BFE/PS (headline) and Max (best of market, optimistic); Avg never needed
+# `exch` = BFE/PS pre-closing price (headline, cross-book in 2024/25: see section 1),
+# `max` = best-of-market Max price (optimistic) and
+# `ref` = the row's own reference book, so bet price, pool market leg and CLV denominator are the
+# same venue (PS up to 2024/25, BFE from 2025/26). Avg is never a bet venue on its own.
+SCENARIOS = ("exch", "max", "ref")
 HEADLINE = "exch"
+CAP_SWEEP = (1.05, 1.10, 1.15, 1.20)  # MAX_RATIO_CAP sensitivity (m4)
 MODELS = {
     "1x2": ["dc", "elo", "pi", "lgb_goals", "lgb_xg", "cb_goals", "cb_xg", "lgbd_xg"],
     "ou25": ["dc", "lgb_goals", "lgb_xg", "cb_goals", "cb_xg", "lgbd_xg"],
@@ -71,13 +73,27 @@ def load_market(rb, market: str) -> pd.DataFrame:
     return d.dropna(subset=need).sort_values(["kickoff_utc"], kind="mergesort")
 
 
-def price_tables(rb, odds: pd.DataFrame, idx: dict[str, pd.Index]) -> dict:
-    """Pre-closing bet prices per scenario and market, aligned to the evaluation rows."""
+def price_tables(rb, odds: pd.DataFrame, data: dict, max_ratio_cap: float = MAX_RATIO_CAP) -> dict:
+    """Pre-closing bet prices per scenario and market, aligned to the evaluation rows.
+
+    * ``exch`` - Betfair Exchange (BFE) pre price where present, else Pinnacle (PS) pre. This is a
+      *cross-book* price for the seasons where BFE exists but the pool's market leg and the CLV
+      denominator are Pinnacle (see section 1 of the report): the bet price and the close come from
+      different venues for those rows.
+    * ``max`` - best-of-market ``Max`` pre price, bad-quote guard applied.
+    * ``ref`` - the row's own reference book (``ref_pre`` in the evaluation frame, the book behind
+      ``ref_close`` and the pool's market leg), so bet price, pool and close are the same venue.
+    """
     out = {s: {} for s in SCENARIOS}
     guard: dict[str, pd.Series] = {}
-    for market, ix in idx.items():
+    for market, dm in data.items():
+        df = dm["frame"]
+        ix = df.index
         sels = list(rb.SELS[market])
-        w = {b: rb._wide(odds, b, market, "pre").reindex(ix) for b in ("BFE", "PS", "Max")}
+        w = {
+            b: rb._wide(odds, b, market, "pre").reindex(ix)
+            for b in ("BFE", "PS", "Max", "Avg")
+        }
         ex = w["BFE"].copy()
         src = pd.Series(np.where(ex.notna().all(axis=1), "BFE", ""), index=ix)
         use_ps = ~ex.notna().all(axis=1) & w["PS"].notna().all(axis=1)
@@ -86,15 +102,26 @@ def price_tables(rb, odds: pd.DataFrame, idx: dict[str, pd.Index]) -> dict:
         ex.loc[src == ""] = np.nan
         out["exch"][market] = (ex[sels], src.where(src != "", "none"))
         mx = w["Max"][sels]
-        # data-error guard: a best-of-market price more than MAX_RATIO_CAP above the exchange-like
+        # data-error guard: a best-of-market price more than max_ratio_cap above the exchange-like
         # price of the same selection is treated as a bad quote and the match is dropped (the Max
         # columns of 2024/25+ contain such prices; see section 'Max price guard' in the report).
-        bad = ((mx / ex[sels]).max(axis=1) > MAX_RATIO_CAP) & ex[sels].notna().all(axis=1)
+        bad = ((mx / ex[sels]).max(axis=1) > max_ratio_cap) & ex[sels].notna().all(axis=1)
         mx = mx.mask(bad)
         guard[market] = bad
         out["max"][market] = (
             mx,
             pd.Series(np.where(mx.notna().all(axis=1), "Max", "none"), index=ix),
+        )
+        # same-book: take each row from the book that is already its pool leg / CLV denominator
+        ref_pre = df["ref_pre"].astype(str).to_numpy()
+        price = np.full((len(ix), len(sels)), np.nan, dtype=float)
+        for b in ("PS", "BFE", "Avg"):
+            m = ref_pre == b
+            if m.any():
+                price[m] = w[b].to_numpy(dtype=float)[m]
+        out["ref"][market] = (
+            pd.DataFrame(price, index=ix, columns=sels),
+            pd.Series(ref_pre, index=ix, name="source"),
         )
     out["_guard"] = guard
     return out
@@ -129,7 +156,7 @@ def run_scenario(data: dict, prices: dict, name: str) -> dict:
     for market, dm in data.items():
         d = dm["frame"]
         px, src = prices[name][market]
-        meta = d[["div", "season", "kickoff_utc"]].copy()
+        meta = d[["div", "season", "kickoff_utc", "ref_pre", "ref_close"]].copy()
         meta["source"] = src.to_numpy()
         price = px.to_numpy(float)
         best[market] = S.candidate_table(meta, market, price, dm["close"], dm["pooled"], dm["y"])
@@ -149,10 +176,19 @@ def run_scenario(data: dict, prices: dict, name: str) -> dict:
 
 
 def ledger_hash(res: dict) -> str:
+    """B0.4 determinism hash over the above-threshold AND selected ledgers of one scenario.
+
+    The selected ledger alone is empty for a scenario that never qualified a whitelist (the
+    headline ``exch`` run), so hashing only it would be vacuous; the above-threshold ledger is
+    non-empty whenever the scenario placed any candidate.
+    """
     b = res["bets"]
-    sel = b[b["selected"]].reset_index().sort_values(["match_id", "market"])
-    cols = ["match_id", "market", "sel", "price", "edge", "kelly", "model"]
-    return hashlib.sha256(sel[cols].to_csv(index=False, float_format="%.12g").encode()).hexdigest()
+    h = hashlib.sha256()
+    cols = ["match_id", "market", "sel", "price", "p_close", "edge", "kelly", "model"]
+    for flag in ("above_threshold", "selected"):
+        frame = b[b[flag]].reset_index().sort_values(["match_id", "market"])
+        h.update(frame[cols + [flag]].to_csv(index=False, float_format="%.12g").encode())
+    return h.hexdigest()
 
 
 # ------------------------------------------------------------------ helpers for the report
@@ -227,13 +263,22 @@ def baseline_text(name: str, o: dict) -> str:
 
 def summary_text(out: dict, res: dict) -> str:
     e, m = out["exch"], out["max"]
+    rf = out.get("ref", {})
     no_wl = e["overall_nowl"]
     txt = [
         "With the exchange-like price (BFE/PS) the in-fold selection never found a whitelist: "
         f"{e['overall'].get('n', 0)} bets were placed. Forcing bets above the in-fold threshold without the "
         f"whitelist gives n={no_wl.get('n', 0)}, net CLV {f(no_wl.get('clv_net'), 4, True)} "
-        f"[{f(no_wl.get('clv_net_lo'), 4, True)}, {f(no_wl.get('clv_net_hi'), 4, True)}], flat ROI {f(no_wl.get('roi_flat'), 2, True)}.",
+        f"[{f(no_wl.get('clv_net_lo'), 4, True)}, {f(no_wl.get('clv_net_hi'), 4, True)}], flat ROI {f(no_wl.get('roi_flat'), 2, True)} "
+        f"(raw CLV {f(no_wl.get('clv_raw'), 4, True)}). That ledger is CROSS-BOOK for the rows whose bet price is Betfair while the pool leg and the close are Pinnacle (section 1).",
     ]
+    if rf:
+        rn = rf.get("overall_nowl", {})
+        txt.append(
+            "The same-book scenario `ref` (bet price, pool market leg and close from the row's own reference book: PS pre vs PS close up to 2024/25, BFE pre vs BFE close after) gives "
+            f"n={rn.get('n', 0)} above threshold, net CLV {f(rn.get('clv_net'), 4, True)} "
+            f"[{f(rn.get('clv_net_lo'), 4, True)}, {f(rn.get('clv_net_hi'), 4, True)}], flat ROI {f(rn.get('roi_flat'), 2, True)}."
+        )
     mo = m["overall"]
     if mo.get("n"):
         txt.append(
@@ -241,9 +286,20 @@ def summary_text(out: dict, res: dict) -> str:
             f"net CLV {f(mo['clv_net'], 4, True)} [{f(mo['clv_net_lo'], 4, True)}, {f(mo['clv_net_hi'], 4, True)}], "
             f"raw CLV {f(mo['clv_raw'], 4, True)}, flat ROI {f(mo['roi_flat'], 2, True)}."
         )
+    cfgs_all = [res[s]["cfgs"].assign(scenario=s) for s in res if len(res[s]["cfgs"])]
+    neg = pd.concat(cfgs_all) if cfgs_all else pd.DataFrame()
+    neg = neg[neg["hist_clv"] <= 0] if len(neg) else neg
     txt.append(
-        "The pooled model weight against the sharp price is about zero for every non-decorrelated model, so the pooled probability is the market probability and there is no edge to find (B0.6)."
+        "The pooled model weight against the sharp price is about zero for every non-decorrelated model, so the pooled probability is the market probability and there is no edge to find (B0.6). The model the `exch` folds actually bet is `lgbd_xg`, whose probabilities are 99.83% correlated with the de-margined pre-closing price because it is trained on it - a market-recalibration baseline, not new information (section 1)."
     )
+    if len(neg):
+        cells = ", ".join(
+            f"`{r.scenario}` {r.season} {r.market} {r.model} thr {r.threshold:.2f} hist_clv {f(r.hist_clv, 4, True)}"
+            for r in neg.itertuples()
+        )
+        txt.append(
+            f"The in-fold threshold rule has no positivity floor, so {len(neg)} fold(s) were selected with a NEGATIVE in-fold net CLV ({cells}); see section 1 and B0.9 (PARTIAL)."
+        )
     return " ".join(txt)
 
 
@@ -370,6 +426,37 @@ def sweep_table(res: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def cap_sweep(data: dict, rb, odds: pd.DataFrame) -> pd.DataFrame:
+    """m4: MAX_RATIO_CAP sensitivity - re-run the `max` scenario under each cap.
+
+    Diagnostic only: nothing here feeds a selection. Re-runs the full walk-forward at each cap so
+    the reader can see how much of the `max` result is the bad-quote filter rather than the market.
+    """
+    rows = []
+    for cap in CAP_SWEEP:
+        pr = price_tables(rb, odds, data, max_ratio_cap=cap)
+        r = run_scenario(data, pr, "max")
+        b = r["bets"]
+        above, sel = b[b["above_threshold"]], b[b["selected"]]
+        ma = S.ledger_metrics(above, N_BOOT)
+        ms = S.ledger_metrics(sel, N_BOOT)
+        rows.append(
+            {
+                "cap": cap,
+                "rows_dropped": int(sum(int(v.sum()) for v in pr["_guard"].values())),
+                "n_above": ma.get("n", 0),
+                "above_net_clv": ma.get("clv_net"),
+                "above_raw_clv": ma.get("clv_raw"),
+                "above_roi": ma.get("roi_flat"),
+                "n_selected": ms.get("n", 0),
+                "sel_net_clv": ms.get("clv_net"),
+                "sel_raw_clv": ms.get("clv_raw"),
+                "sel_roi": ms.get("roi_flat"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 # ------------------------------------------------------------------ final configuration
 def final_config(data: dict, res: dict, gate_pass: bool) -> tuple[dict, pd.DataFrame]:
     """In-fold selection for the NEXT unseen fold: all seasons so far are history."""
@@ -436,14 +523,15 @@ def main() -> None:  # pragma: no cover - CLI driver
     rb = _load_rb()
     odds = pd.read_parquet(INTERIM / "odds.parquet")
     data = prepare(rb)
-    prices = price_tables(rb, odds, {m: dm["frame"].index for m, dm in data.items()})
-    del odds
+    prices = price_tables(rb, odds, data)
 
     res = {s: run_scenario(data, prices, s) for s in SCENARIOS}
     res2 = {s: run_scenario(data, prices, s) for s in SCENARIOS}
     hashes = {s: ledger_hash(res[s]) for s in SCENARIOS}
     deterministic = all(hashes[s] == ledger_hash(res2[s]) for s in SCENARIOS)
     print("hashes", hashes, "deterministic", deterministic, flush=True)
+    caps = cap_sweep(data, rb, odds)
+    del odds
 
     out = {}
     for s in SCENARIOS:
@@ -477,6 +565,11 @@ def main() -> None:  # pragma: no cover - CLI driver
         rnd = S.random_baseline(cand, counts, N_RAND)
         o["fav_same"] = S.ledger_metrics(fav_same, N_BOOT) if len(fav_same) else {"n": 0}
         o["fav_all"] = S.ledger_metrics(fav_all, N_BOOT)
+        # m9: the strategy-vs-favourite difference, paired per (match_id, market) and bootstrapped,
+        # so section 5 reports a test rather than a point comparison of two CIs
+        o["fav_paired"] = (
+            S.paired_clv_diff(sel, fav_same) if len(sel) and len(fav_same) else {"n": 0}
+        )
         o["rand"] = rnd
         out[s] = o
         print(s, "selected bets", len(sel), "above", len(above), flush=True)
@@ -524,6 +617,9 @@ def main() -> None:  # pragma: no cover - CLI driver
     ]
     w_ok = bool(ok_models)
     clv_pos = n_sel > 0 and ov["clv_net_lo"] > 0
+    _cfg_parts = [res[s]["cfgs"].assign(scenario=s) for s in res if len(res[s]["cfgs"])]
+    _cfgs_all = pd.concat(_cfg_parts) if _cfg_parts else pd.DataFrame()
+    neg_cfgs = _cfgs_all[_cfgs_all["hist_clv"] <= 0] if len(_cfgs_all) else _cfgs_all
     gates = {
         "B0.1": (
             "PASS" if sizing < 0.03 else "FAIL",
@@ -541,7 +637,7 @@ def main() -> None:  # pragma: no cover - CLI driver
         ),
         "B0.4": (
             "PASS" if deterministic else "FAIL",
-            "this script runs the full strategy pipeline twice in-process and compares sha256 of the selected-bet ledger: "
+            "this script runs the full strategy pipeline twice in-process and compares sha256 of the above-threshold AND selected ledgers (the selected ledger alone is empty for a scenario that never qualified a whitelist, so hashing only it would be vacuous): "
             + "; ".join(f"{k}={v[:12]}" for k, v in hashes.items())
             + (" (identical)" if deterministic else " (DIFFERENT)"),
         ),
@@ -568,8 +664,13 @@ def main() -> None:  # pragma: no cover - CLI driver
             "modelled: 6% commission on net winnings per market (`stats.simulate_bankroll`), bet-time policy (pre-closing snapshot, kickoff-24h ASSUMED not verified), per-bet stake cap 1% of bankroll (limits.toml), one bet per match-market. NOT demonstrable on football-data history: order-book depth/liquidity and takeable-price checks (no depth in the data); deferred to Phase 6 (stake only if snapshot depth >= stake)",
         ),
         "B0.9": (
-            "PASS",
-            "threshold, Kelly fraction, whitelist, model and pool weight chosen in-fold per test season (section 4, config table); test_strategy.py checks the choice is unchanged when future seasons are altered",
+            "PARTIAL",
+            "threshold, Kelly fraction, whitelist, model and pool weight are chosen in-fold per test season (section 4, config table) and tests/test_strategy.py checks the choice is unchanged when future seasons are altered - that half is PASS. But the threshold rule has **no performance floor**: `_score` (mean net CLV x sqrt(n)) is maximised over the thresholds and the argmax wins whenever its history subset has >= 100 bets, so folds whose in-fold history lost money are still selected (this run: "
+            + "; ".join(
+                f"{r.scenario} {r.season} {r.market} thr {r.threshold:.2f} hist_clv {r.hist_clv * 100:.2f}%"
+                for r in neg_cfgs.itertuples()
+            )
+            + "). Only the whitelist can return a no-bet fold. Documented in section 1 and pinned by tests/test_strategy.py::test_select_market_config_has_no_positivity_floor rather than 'fixed', because a hist_clv > 0 floor would empty the exch ledger in every fold and hide the configuration.",
         ),
         "B0.10": (
             "PASS",
@@ -596,6 +697,8 @@ def main() -> None:  # pragma: no cover - CLI driver
         "market",
         "sel",
         "source",
+        "ref_pre",
+        "ref_close",
         "model",
         "edge",
         "p",
@@ -603,6 +706,7 @@ def main() -> None:  # pragma: no cover - CLI driver
         "p_close",
         "won",
         "clv_net",
+        "clv_raw",
         "kelly",
         "whitelisted",
         "selected",
@@ -630,8 +734,20 @@ def main() -> None:  # pragma: no cover - CLI driver
         p_rand,
         pytest_txt,
         sweep,
+        caps,
     )
     print("done; gate0_passed =", gate_pass, flush=True)
+
+
+def _max_bets_per_day(out: dict) -> int:
+    """Busiest UTC day across every scenario's above-threshold ledger (n3: limits.toml cap)."""
+    best = 0
+    for o in out.values():
+        if not isinstance(o, dict) or "above" not in o or not len(o["above"]):
+            continue
+        days = pd.to_datetime(o["above"]["kickoff_utc"], utc=True).dt.floor("D")
+        best = max(best, int(days.value_counts().max()))
+    return best
 
 
 def write_report(
@@ -649,6 +765,7 @@ def write_report(
     p_rand,
     pytest_txt,
     sweep,
+    caps,
 ):  # pragma: no cover
     L: list[str] = []
     h = out[HEADLINE]
@@ -665,14 +782,18 @@ def write_report(
         "",
         "- Test seasons: the P3/P4 walk-forward predictions (18 divisions, 2016/17 to 2026/27 partial). Pool weights use seasons before the test season, so the first usable season is 2017/18; the in-fold selection needs two prior seasons of ledger, so strategy bets start in 2019/20.",
         "- Fair probability: log opinion pool of one model with the de-margined (power) pre-closing reference price of the same match; `w` fit on all earlier seasons per market and model. Candidate models: dc, elo, pi (1X2 only), lgb_goals, lgb_xg, cb_goals, cb_xg, lgbd_xg. Model per fold: lowest pooled log loss on history.",
-        "- Bet price: the pre-closing price. Source rule per match: Betfair Exchange (BFE) if present, else Pinnacle (PS, never after the 2025-07-23 staleness cut, stale rows are excluded upstream), (an Avg fallback was never needed: every evaluation row has a BFE or PS price, because the evaluation join already required a reference book). Scenarios: `exch` = BFE/PS (headline), `max` = best-of-market `Max` price (optimistic). All are run through the same machinery.",
+        "- Bet price: the pre-closing price. Source rule per match: Betfair Exchange (BFE) if present, else Pinnacle (PS, never after the 2025-07-23 staleness cut, stale rows are excluded upstream), (an Avg fallback was never needed: every evaluation row has a BFE or PS price, because the evaluation join already required a reference book). Scenarios: `exch` = BFE/PS (headline), `max` = best-of-market `Max` price (optimistic), `ref` = the row's own reference book, so bet price, pool market leg and CLV denominator are all the same venue. All are run through the same machinery.",
+        "- **`exch` is a CROSS-BOOK price up to 2024/25.** The pool's market leg and the CLV denominator come from the evaluation frame's `ref_pre`/`ref_close`, which `run_baselines.reference_books` fixes to **Pinnacle** for seasons up to and including 2024/25 and to Betfair Exchange from 2025/26. The `exch` bet price is Betfair whenever BFE exists. So a 2024/25 `exch` bet is priced on Betfair's pre-closing price but scored against the **Pinnacle** close, with Pinnacle's pre-closing price as the pool leg: the report's `exch` CLV is not a same-venue closing-line value for those rows, and the ledger carries `source` (bet price), `ref_pre` and `ref_close` per bet so the mix is auditable. The `ref` scenario is the internally consistent one (PS pre vs PS close up to 2024/25, BFE pre vs BFE close from 2025/26) and is reported beside it; the headline stays `exch` because it is the venue the desk would actually trade on. Rows by (source, ref_pre, ref_close) are in `gate0_ledger_<scenario>.csv`.",
         f"- Edge = p x (1 + (price-1) x (1-{COMMISSION:.2f})) - 1, i.e. EV per unit stake with 6% commission on winnings. At most one bet per match-market (largest edge). A bet needs edge > threshold and (div, market) in the in-fold whitelist.",
         "- In-fold choices from prior seasons only: model (min pooled log loss); threshold in {0, 0.02, 0.04, 0.06, 0.08} (maximise mean net CLV x sqrt(n), at least 100 history bets); whitelist = divisions with >= 25 history bets and mean net CLV > 0; Kelly fraction in {0.1, 0.25} (best log growth on the history ledger subject to a 20% drawdown cap, stake cap 1% of bankroll).",
-        "- CLV = log(price x p_close_fair), p_close_fair = margin-free (power) closing probability of the reference close book. **net CLV** uses the commission-adjusted price (the one the strategy is judged on); **raw CLV** uses the quoted price. CIs: match-clustered bootstrap, 1000 resamples, seed 0.",
+        "- **The threshold rule has no positivity floor.** `_score` is mean net CLV x sqrt(n) and the argmax wins whenever its history subset has >= 100 bets, so a threshold whose in-fold history *lost money* is still selected; only the whitelist can produce a fold with no bets. This run does exactly that: every `exch` fold and the `max`/`ref` 1x2 folds up to 2026/27 are negative (the exact list is in the B0.9 row and in the `hist_clv` column of section 4). A `hist_clv > 0` floor was considered and rejected: it would empty the `exch` ledger in every fold and hide the configuration rather than fix it. B0.9 is therefore graded **PARTIAL** - the choices are genuinely in-fold, but the threshold rule itself has no performance floor. The behaviour is pinned by `tests/test_strategy.py::test_select_market_config_has_no_positivity_floor`.",
+        "- **`lgbd_xg` is a market-recalibration baseline, not independent information.** Its GBM is trained with `init_score = log p_market(pre-closing)`, so `softmax(log p_market + f(x))` keeps the market as its prior: against the de-margined pre-closing price its 1x2 probabilities correlate 0.9983 (`corr(raw_H, pre_H)`, mean absolute difference 0.0063, n=66,373). `pick_model` picks it in **every** `exch` fold because a market-anchored model has a floor in the pooled log-loss race against `lgb_xg`/`cb_xg` - the pooled probability is the market probability times `exp(w f)`. Its non-zero weight row in section 7 is the weight on that *residual given the price it consumed*, not evidence of new information, and the `exch` bets are the extreme right tail of that residual (mean price 7.46).",
+        "- CLV = log(price x p_close_fair), p_close_fair = margin-free (power) closing probability of the reference close book. **net CLV** uses the commission-adjusted price (the money metric, and the in-fold selection target); **raw CLV** uses the quoted price (the skill metric, M3 P1.2). Both are reported; net decides the gate bar. Commission makes the metric price-dependent - at the headline ledger's mean price 7.46 the commission term is about -4.7%, so +0.97% raw CLV is -3.76% net. CIs: match-clustered bootstrap, 1000 resamples, seed 0.",
         "- ROI: flat = 1 unit per bet, net of 6% commission on winnings; Kelly = fractional Kelly on commission-adjusted odds, daily bankroll updates, per-market commission, 1000 starting bankroll. Max drawdown on that bankroll path.",
-        "- Baselines on the same ledger: back-the-favourite (shortest price) on (a) the matches the strategy bet and (b) every match in the test folds; random selection with the same bet count per (div, season, market) cell, 200 replicates.",
+        "- Baselines on the same ledger: back-the-favourite (shortest price) on (a) the matches the strategy bet and (b) every match in the test folds; random selection with the same bet count per (div, season, market) cell, 200 replicates. The strategy-vs-favourite difference is bootstrapped paired per (match_id, market) (section 5).",
+        f"- Risk limits: `config/limits.toml` sets `max_bets_per_day = 20`. It is not applied by the simulator (which has no edge column with which to drop a day's excess) and it never binds on this ledger: the busiest day carries {_max_bets_per_day(out)} above-threshold bets. The live desk enforces it (Phase 6).",
         "",
-        "## 2. Headline results (exch = BFE/PS pre-closing price)",
+        "## 2. Headline results (exch = BFE/PS pre-closing price; see section 1 on the cross-book mix)",
         "",
     ]
     for s in SCENARIOS:
@@ -699,9 +820,46 @@ def write_report(
         "",
     ]
     L += [
-        f"A first run showed `Max` over/under prices of 2.25 to 2.50 where Avg and BFE quoted 1.5 to 2.0, giving a spurious +13% net CLV on 25 bets in 2026/27. The Max columns of 2024/25+ contain such quotes. `max` rows are therefore dropped when any selection's Max price exceeds {MAX_RATIO_CAP:.2f} x the BFE/PS price of that selection. This guard was added after seeing that result; it removes the data errors but is blunt: it also drops legitimate rows where Max is more than 10% above BFE/PS on a long-priced selection (6-12% of 1X2 rows in every season). It was not tuned on results. Rows dropped:",
+        f"A first run showed `Max` over/under prices of 2.25 to 2.50 where Avg and BFE quoted 1.5 to 2.0, giving a spurious +13% net CLV on 25 bets in 2026/27. The Max columns of 2024/25+ contain such quotes. `max` rows are therefore dropped when any selection's Max price exceeds {MAX_RATIO_CAP:.2f} x the BFE/PS price of that selection. This guard was added after seeing that result (post hoc, not pre-registered) and was not tuned: it removes the data errors but is blunt - it also drops legitimate rows where Max is above BFE/PS on a long-priced selection (6-12% of 1X2 rows in every season). Provenance: the constant is `MAX_RATIO_CAP` in `scripts/run_strategy.py`, and its sensitivity is swept below. Rows dropped:",
         "",
         md(out["_guard_tbl"], ["market", "season", "n_rows", "n_dropped", "share"]),
+        "",
+        f"**Sensitivity of the whole `max` result to the cap** (`{', '.join(f'{c:.2f}' for c in CAP_SWEEP)}`), re-running the full walk-forward at each cap (diagnostic, no selection reads it):",
+        "",
+    ]
+    cp = caps.copy()
+    for c in ("above_net_clv", "above_raw_clv", "sel_net_clv", "sel_raw_clv"):
+        cp[c] = cp[c].map(lambda v: f(v, 4, True))
+    for c in ("above_roi", "sel_roi"):
+        cp[c] = cp[c].map(lambda v: f(v, 2, True))
+    L += [
+        md(
+            cp,
+            [
+                "cap",
+                "rows_dropped",
+                "n_above",
+                "above_net_clv",
+                "above_raw_clv",
+                "above_roi",
+                "n_selected",
+                "sel_net_clv",
+                "sel_raw_clv",
+                "sel_roi",
+            ],
+            [
+                "cap",
+                "rows dropped",
+                "n above",
+                "net CLV above",
+                "raw CLV above",
+                "flat ROI above",
+                "n selected",
+                "net CLV selected",
+                "raw CLV selected",
+                "flat ROI selected",
+            ],
+        ),
         "",
     ]
     for s in SCENARIOS:
@@ -757,6 +915,10 @@ def write_report(
     ]
 
     L += ["## 4. In-fold configuration chosen for each test season", ""]
+    L += [
+        "`hist_clv` / `hist_clv_raw` are the history ledger's mean net / raw CLV at the chosen threshold. There is no positivity floor (section 1): negative values here are folds that were selected anyway.",
+        "",
+    ]
     for s in SCENARIOS:
         L += [f"### Scenario `{s}`", ""]
         cf = res[s]["cfgs"]
@@ -766,6 +928,7 @@ def write_report(
                     threshold=cf["threshold"].map(lambda v: f"{v:.2f}"),
                     kelly=cf["kelly"].map(lambda v: f"{v:.2f}"),
                     hist_clv=cf["hist_clv"].map(lambda v: f(v, 4, True)).values,
+                    hist_clv_raw=cf["hist_clv_raw"].map(lambda v: f(v, 4, True)).values,
                 ),
                 [
                     "season",
@@ -775,6 +938,7 @@ def write_report(
                     "kelly",
                     "hist_n",
                     "hist_clv",
+                    "hist_clv_raw",
                     "whitelist",
                 ],
             )
@@ -813,12 +977,17 @@ def write_report(
     ]
 
     L += ["## 5. Baselines on the same ledger", ""]
+    L += [
+        "The strategy-vs-favourite column is a **paired** match-clustered bootstrap over the (match_id, market) bets both sides have in common (1000 resamples, seed 0), so it is a test; the unpaired columns beside it are point comparisons.",
+        "",
+    ]
     rows = []
     for s in SCENARIOS:
         o = out[s]
         if not o["overall"].get("n"):
             continue
         rn = o["rand"]
+        pair = o.get("fav_paired", {"n": 0})
         rows.append(
             {
                 "scenario": s,
@@ -826,6 +995,13 @@ def write_report(
                 "strategy net CLV": f(o["overall"]["clv_net"], 4, True),
                 "fav (same matches) n": o["fav_same"].get("n"),
                 "fav (same) net CLV": f(o["fav_same"].get("clv_net"), 4, True),
+                "paired diff vs fav [95% CI]": (
+                    f"{f(pair.get('mean'), 4, True)} [{f(pair.get('lo'), 4, True)}, "
+                    f"{f(pair.get('hi'), 4, True)}] (n={pair.get('n', 0)}, "
+                    f"P(diff>0)={f(pair.get('p_gt0'), 3)})"
+                    if pair.get("n")
+                    else "-"
+                ),
                 "fav (all fold matches) net CLV": f(o["fav_all"].get("clv_net"), 4, True),
                 "random net CLV mean [2.5%, 97.5%]": f"{f(rn['clv_net'].mean(), 4, True)} [{f(rn['clv_net'].quantile(0.025), 4, True)}, {f(rn['clv_net'].quantile(0.975), 4, True)}]",
                 "P(random >= strategy)": f(
@@ -843,17 +1019,30 @@ def write_report(
         L += [md(t, list(t.columns)), ""]
     else:
         L += ["No bets placed in any scenario.", ""]
+    if out["max"]["overall"].get("n") and len(out["max"]["by_market_nowl"]):
+        sel_roi = out["max"]["overall"].get("roi_flat")
+        nowl_roi = out["max"]["overall_nowl"].get("roi_flat")
+        if sel_roi is not None and nowl_roi is not None:
+            L += [
+                f"**The in-fold whitelist hurt out of sample in the `max` scenario**: with the whitelist {out['max']['overall']['n']} bets at flat ROI {f(sel_roi, 2, True)}; without it {out['max']['overall_nowl']['n']} bets at flat ROI {f(nowl_roi, 2, True)}. The whitelist is chosen on history, so this is the out-of-sample cost of that selection step, and it strengthens the no-edge conclusion.",
+                "",
+            ]
+    L += [
+        "The `max` point comparison is not a test (no CI on the difference); the paired column above is.",
+        "",
+    ]
 
     L += [
         "## 6. B0.5 benchmark: model vs de-margined sharp close, every season",
         "",
-        "Slope = pooled one-vs-rest calibration slope; ECE on the pooled one-vs-rest probabilities. `pooled_*` rows are the in-fold pooled probabilities the strategy actually used (NaN/absent in 2016/17).",
+        "Slope = pooled one-vs-rest calibration slope; ECE on the pooled one-vs-rest probabilities. `pooled_*` rows are the in-fold pooled probabilities the strategy actually used (NaN/absent in 2016/17). `n.e.` = not estimable: the logistic recalibration separated at this n (|slope| > 10), so the value is a sample-size artefact rather than a calibration measurement.",
         "",
     ]
     for market in S.SELECTIONS:
         bm = bench[bench["market"] == market].copy()
-        for c in ("rps", "log_loss", "brier", "slope", "ece"):
+        for c in ("rps", "log_loss", "brier", "ece"):
             bm[c] = bm[c].map(lambda v: f"{v:.4f}")
+        bm["slope"] = bm["slope"].map(M.fmt_slope)
         L += [
             f"### {market}",
             "",
@@ -863,6 +1052,8 @@ def write_report(
 
     L += [
         "## 7. B0.6 pool weight on the model, all test seasons (match-clustered bootstrap, 150 resamples)",
+        "",
+        "**Read the `lgbd_xg` rows as a market-recalibration baseline, not as new information.** Its GBM trains on `init_score = log p_market(pre-closing)`, so its raw probabilities are 99.83% correlated with the de-margined pre-closing price (mean absolute difference 0.0063); the weight below is the weight on the *residual*, holding the price it consumed at weight 1, and `pick_model` picks it in every `exch` fold for exactly that reason (a market-anchored model has a floor in the log-loss race). The `lgb_xg` rows, which never see the price, are the honest test of new information, and they sit on the w = 0 boundary.",
         "",
     ]
     pt = pools.copy()
@@ -915,9 +1106,11 @@ def write_report(
         "## 10. Caveats and unverified assumptions",
         "",
         "- The `pre` price in football-data.co.uk has no true timestamp; P1 assumed kickoff-24h (`available_at`). If the snapshot is actually earlier or later, bet timing, CLV and the pool weights (which are fit against this price) change. UNVERIFIED.",
-        "- BFE prices exist only from 2024/25 (and PS is used before): `exch` mixes two sources, reported separately in section 2. Exchange commission is applied to PS prices too (a PS bet would not pay commission but would face a margin; the exchange-equivalent assumption is the conservative one).",
-        "- `max` is the best price across many books at an unknown time and is not obtainable at size; treat it as an upper bound. Its RAW CLV of about +3% (above the 3% leakage alarm in AGENTS.md) was investigated: (1) a first run showed +13% net CLV on 25 bets in 2026/27 that were bad Max quotes (guard section); (2) after the guard, the random same-count baseline on the same Max prices has clearly negative CLV (section 5: random raw and net CLV columns) and the favourite baseline on the same matches +0.14% net, so the strategy's lead over random is the market-pooled edge selection picking the largest Max-vs-pool gaps, i.e. best-of-market price optimism plus selecting extreme quotes, not model skill; (3) net CLV (commission applied, though a real bookmaker bet pays none) is +0.47% with a CI including 0 and flat ROI is negative. No lookahead path was found: pool weights, model, threshold, whitelist and Kelly fraction only see earlier seasons (tests).",
-        "- Liquidity, price-moving and bet limits are not modelled (B0.8 PARTIAL).",
+        "- BFE prices exist only from 2024/25 (and PS is used before): `exch` mixes two sources, reported separately in section 2, **and it is cross-book in a second sense** - for 2024/25 the bet price is Betfair while the pool's market leg and the CLV denominator are Pinnacle (section 1). `gate0_ledger_exch.csv` carries `source`, `ref_pre` and `ref_close` per bet so the mix is auditable, and the same-book `ref` scenario is the internally consistent read. Exchange commission is applied to PS prices too (a PS bet would not pay commission but would face a margin; the exchange-equivalent assumption is the conservative one).",
+        "- `max` is the best price across many books at an unknown time and is not obtainable at size; treat it as an upper bound. It also carries the `MAX_RATIO_CAP` bad-quote filter, a post-hoc, untuned choice, and the result is sensitive to it: the sweep in section 2 moves the above-threshold net CLV from -1.75% (cap 1.05) through +0.21% (1.10, the shipped constant) to +0.44%/+0.46% (1.15/1.20) and the flat ROI from -4.90% to +8.60%/+8.43%, so read `max` as a range, not a point. The looser caps keep longer and more optimistic best-of-market quotes (raw CLV 0.54% -> 3.71%), which is the same best-of-market-optimism mechanism identified below; the caps above 1.10 also raise flat ROI past the 5% AGENTS.md leakage alarm, which is flagged here and NOT investigated further in this card (the shipped constant was fixed at 1.10 before this sweep was run). Its RAW CLV of about +3% (above the 3% leakage alarm in AGENTS.md) was investigated: (1) a first run showed +13% net CLV on 25 bets in 2026/27 that were bad Max quotes (guard section); (2) after the guard, the random same-count baseline on the same Max prices has clearly negative CLV (section 5: random raw and net CLV columns) and the favourite baseline on the same matches +0.14% net, so the strategy's lead over random is the market-pooled edge selection picking the largest Max-vs-pool gaps, i.e. best-of-market price optimism plus selecting extreme quotes, not model skill; (3) net CLV (commission applied, though a real bookmaker bet pays none) is +0.47% with a CI including 0 and flat ROI is negative. No lookahead path was found: pool weights, model, threshold, whitelist and Kelly fraction only see earlier seasons (tests).",
+        "- **The in-fold whitelist lost money out of sample** in the `max` scenario (section 5): fewer bets with the whitelist at a worse flat ROI than without it.",
+        "- Liquidity, price-moving and bet limits are not modelled (B0.8 PARTIAL). `max_bets_per_day = 20` from `config/limits.toml` is not applied by the simulator but never binds on this ledger (busiest day: " + str(_max_bets_per_day(out)) + " above-threshold bets); the live desk enforces it.",
+        "- **Metric choice.** Raw log-CLV is the skill metric (M3 P1.2: did the price beat the fair close?); net log-CLV is the money metric and the in-fold selection target, because 6% commission on net winnings really does make a long price worth less than its quote. Selecting on net CLV optimises what the desk is paid, at the cost of a metric that depends on the bet price - reported side by side with raw CLV, ROI and the paired favourite test so the reader can apply either.",
         "- Whitelist/threshold/model selection is a multiple-comparison exercise on a short history; the out-of-sample folds are the only fair read.",
         "- 2026/27 is a partial season.",
         "",
@@ -933,6 +1126,12 @@ def write_report(
             'Gate 0 did **not** pass, so `config/strategy.toml` has `gate0_passed = false` and `mode = "shadow"`: the desk may snapshot prices and log hypothetical bets, but this card does not recommend treating any of it as an edge. It is the best in-fold configuration, written so Phase 6 can run in shadow mode and gather the live, timestamped evidence (T-24h snapshot, depth, closing price) that history cannot provide.'
         ]
     L += ["", "```toml", (CONFIG / "strategy.toml").read_text(encoding="utf-8").rstrip(), "```", ""]
+    L += [
+        "The `ou25` block above (`threshold = 1.0`, `whitelist = []`, `qualified = false`) means the ou25 market has **no** in-fold configuration: the ou25 history never produced a threshold with >= 100 bets whose argmax survived the search, so the written rule is 'never bet ou25' (a threshold of 1.0 can never be cleared). That is a statement about this history, not a property of the market: the ou25 candidate table starts only in 2019/20 (the earlier ou25 cells have no closing reference book, see reports/v1_baseline.md) so it has three fewer seasons of history than 1x2.",
+        "",
+        "`history_seasons` is the list of seasons whose ledger rows were used to choose this config (the walk-forward test seasons, minus 2016/17 where the pool has no history); it is not the range of raw data. The written config is for the next unseen fold, so every season to date is history.",
+        "",
+    ]
     if len(cfg_rows):
         L += [
             "In-fold selection behind it (history = every season to date):",
@@ -947,7 +1146,7 @@ def write_report(
             "",
         ]
     L += [
-        f"Selected-bet ledger hashes (sha256, exch/max): {', '.join(f'{k} {v[:16]}' for k, v in hashes.items())}",
+        f"Selected-bet + above-threshold ledger hashes (sha256, B0.4, one per scenario): {', '.join(f'{k} {v[:16]}' for k, v in hashes.items())}",
         "",
     ]
     (REPORTS / "gate0.md").write_text("\n".join(L) + "\n", encoding="utf-8", newline="\n")

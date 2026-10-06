@@ -14,7 +14,23 @@ Pipeline (all walk-forward; nothing here sees a season it is not allowed to):
 
 CLV is ``log(price * p_close_fair)`` (``fedge.backtest.stats.log_clv``) against the margin-free
 closing probability; the ``net`` version uses the commission-adjusted price, the ``raw`` one the
-quoted price. The strategy is judged on ``net``.
+quoted price. Two metrics, two jobs:
+
+* **raw log-CLV is the skill metric**: did the price taken beat the fair closing price? This is the
+  M3 P1.2 definition and the only version comparable across scenarios and bet prices.
+* **net log-CLV is the money metric** and the in-fold selection target: commission is charged on
+  net market winnings, so a long price really is worth less than its quote (at the headline
+  ledger's mean price 7.46 the commission term is about -4.7%, turning +0.97% raw CLV into -3.76%
+  net). ``select_market_config``/``select_kelly`` therefore optimise the quantity the desk is paid.
+
+Both are reported for every scenario; ``net`` sets the gate bar and ``raw`` is quoted beside it.
+
+``select_market_config`` deliberately has **no positivity floor**: the argmax threshold is accepted
+whenever its history subset has ``MIN_HIST_BETS`` rows, even when its mean net CLV is negative. The
+committed Gate 0 run selects exactly such folds (reports/gate0.md section 1), so the threshold rule
+alone can never return "no bets" - only the whitelist can. A ``hist_clv > 0`` floor was considered
+and rejected: it would empty the headline ``exch`` ledger in every fold, hiding the configuration
+instead of fixing it. The behaviour is documented and pinned by a test.
 """
 
 from __future__ import annotations
@@ -201,7 +217,13 @@ def select_market_config(
     min_bets: int = MIN_HIST_BETS,
     min_cell: int = MIN_CELL_BETS,
 ) -> dict | None:
-    """Threshold and whitelist for one market and one model, from history seasons only."""
+    """Threshold and whitelist for one market and one model, from history seasons only.
+
+    There is no positivity floor on the chosen threshold (see the module docstring and
+    reports/gate0.md section 1): the argmax of ``_score`` wins as long as its subset has
+    ``min_bets`` rows, so ``hist_clv`` may be negative. ``hist_clv_raw`` is the same mean on the
+    quoted-price CLV, the skill metric quoted beside the money metric.
+    """
     h = best[best["season"].isin(list(hist))]
     best_t, best_s = None, -np.inf
     for t in thresholds:
@@ -221,6 +243,9 @@ def select_market_config(
         "whitelist": wl,
         "hist_n": int(len(sel)),
         "hist_clv": float(sel["clv_net"].mean()),
+        "hist_clv_raw": (
+            float(sel["clv_raw"].mean()) if "clv_raw" in sel.columns else float("nan")
+        ),
         "hist_score": float(best_s),
     }
 
@@ -319,6 +344,7 @@ def run_walk_forward(
                     "whitelist": ",".join(cfg["whitelist"]),
                     "hist_n": cfg["hist_n"],
                     "hist_clv": cfg["hist_clv"],
+                    "hist_clv_raw": cfg.get("hist_clv_raw", float("nan")),
                 }
             )
     if parts:
@@ -395,6 +421,56 @@ def cell_metrics(
         met = ledger_metrics(g, n_boot, 0, max_stake_frac)
         rows.append({**dict(zip(by, key, strict=True)), **met})
     return pd.DataFrame(rows)
+
+
+def paired_clv_diff(
+    strategy: pd.DataFrame,
+    baseline: pd.DataFrame,
+    n_boot: int = 1000,
+    seed: int = 0,
+) -> dict:
+    """Match-clustered bootstrap of the paired difference strategy - baseline, per bet.
+
+    ``strategy`` and ``baseline`` are ledgers with ``clv_net`` and a ``market`` column, indexed by
+    ``match_id`` (one bet per match-market). Only the (match_id, market) pairs present in BOTH
+    frames are used, so the two means are estimated on the same matches and the difference is a
+    paired statistic (a point comparison of two independent CIs is not a test).
+    """
+    if not len(strategy) or not len(baseline):
+        return {"n": 0}
+    s = pd.Series(
+        strategy["clv_net"].to_numpy(float),
+        index=pd.MultiIndex.from_arrays(
+            [strategy.index.astype(str), strategy["market"].astype(str)]
+        ),
+    )
+    b = pd.Series(
+        baseline["clv_net"].to_numpy(float),
+        index=pd.MultiIndex.from_arrays(
+            [baseline.index.astype(str), baseline["market"].astype(str)]
+        ),
+    )
+    common = s.index.intersection(b.index)
+    if not len(common):
+        return {"n": 0}
+    diff = (s.loc[common] - b.loc[common]).to_numpy()
+    clusters = np.asarray([k[0] for k in common])
+    codes, uniq = pd.factorize(pd.Series(clusters), sort=True)
+    k = len(uniq)
+    sums = np.bincount(codes, weights=diff, minlength=k)
+    counts = np.bincount(codes, minlength=k).astype(float)
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, k, size=(n_boot, k))
+    means = sums[idx].sum(axis=1) / counts[idx].sum(axis=1)
+    lo, hi = np.quantile(means, [0.025, 0.975])
+    return {
+        "n": int(len(diff)),
+        "n_strategy": int(len(strategy)),
+        "mean": float(diff.mean()),
+        "lo": float(lo),
+        "hi": float(hi),
+        "p_gt0": float((means > 0).mean()),
+    }
 
 
 def random_baseline(

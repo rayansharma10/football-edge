@@ -256,3 +256,45 @@ def test_render_strategy_toml_parses():
     assert "shadow" not in tomllib.loads(
         S.render_strategy_toml({"comments": [], "top": {}, "markets": {}})
     )
+
+
+def test_select_market_config_has_no_positivity_floor():
+    """Documented behaviour (gate0.md section 1, B0.9 PARTIAL, review M2).
+
+    The threshold search maximises mean net CLV x sqrt(n) and accepts the argmax whenever the
+    subset has MIN_HIST_BETS rows, so a threshold whose in-fold history LOST money is still
+    selected; only the whitelist can produce a fold with no bets. Pinned here so that adding a
+    positivity floor is a deliberate, test-visible change (it would empty the headline ledger).
+    """
+    n = 400
+    df = pd.DataFrame(
+        {
+            "season": ["a"] * n,
+            "div": np.where(np.arange(n) % 2 == 0, "E0", "D1"),
+            "edge": 0.03,
+            "clv_net": -0.10,
+            "clv_raw": -0.02,
+        }
+    )
+    cfg = S.select_market_config(df, ["a"], min_bets=50, min_cell=10)
+    assert cfg is not None  # a losing history still yields a configuration
+    assert cfg["hist_clv"] < 0 and cfg["hist_score"] < 0
+    assert cfg["hist_clv_raw"] < 0  # the raw (skill) metric is recorded beside the net one
+    assert cfg["hist_n"] == n
+    assert cfg["whitelist"] == []  # the whitelist is the only no-bet gate
+
+
+def test_paired_clv_diff_is_paired_and_deterministic():
+    idx = pd.Index(["a", "b", "c", "d"], name="match_id")
+    strat = pd.DataFrame({"market": "1x2", "clv_net": [0.10, 0.20, -0.05, 0.00]}, index=idx)
+    base = pd.DataFrame({"market": "1x2", "clv_net": [0.00, 0.10, -0.05, -0.10]}, index=idx)
+    d1 = S.paired_clv_diff(strat, base, n_boot=200, seed=0)
+    d2 = S.paired_clv_diff(strat, base, n_boot=200, seed=0)
+    assert d1 == d2  # seeded: same inputs, same output
+    assert d1["n"] == 4 and d1["n_strategy"] == 4
+    assert d1["mean"] == pytest.approx(np.mean([0.10, 0.10, 0.0, 0.10]))
+    assert d1["lo"] <= d1["mean"] <= d1["hi"]
+    # only the (match_id, market) pairs both sides share are used
+    d3 = S.paired_clv_diff(strat, base.iloc[:2], n_boot=100, seed=0)
+    assert d3["n"] == 2 and d3["n_strategy"] == 4
+    assert S.paired_clv_diff(strat.iloc[0:0], base, n_boot=10) == {"n": 0}

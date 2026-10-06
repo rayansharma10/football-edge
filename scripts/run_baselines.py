@@ -629,7 +629,7 @@ def write_report(datasets, scores, pools, details, refs) -> None:  # pragma: no 
         "pre-test matches. 3h embargo between a result and its use.",
         "- **Elo** (own, goal-difference scaled, home advantage) and **pi-ratings** "
         "(penaltyblog `PiRatingSystem`), both computed by a single causal sweep with the same "
-        "3h embargo (a result enters the state only once `kickoff + 3h <= kickoff_predicted`; "
+        "3h embargo (a result enters the state only once `kickoff + 3h < kickoff_predicted`; "
         "`tests/test_ratings.py` proves this equals an `asof`-restricted recomputation).",
         "- The 1X2 model for each rating is an **ordered logit** on the pre-match rating "
         "difference, with `(k, HFA)` / `(alpha, beta)` selected in-fold per (division, test "
