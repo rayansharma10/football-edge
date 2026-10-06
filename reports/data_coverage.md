@@ -282,3 +282,29 @@ Percentages are of all fixture rows in each season file (the current season incl
 - E0 2025/26 Pinnacle 1X2 closing: **210/380** rows filled, last kickoff with a PS closing price **2026-01-08** (expected ~210/380, last 2026-01-08).
 - E1 Betfair Exchange closing first present in season **2024/25** (expected 2024/25). Per season: 2024/25: 552, 2025/26: 516, 2026/27: 95.
 - Seasons with HxG/AxG populated: 2026/27 (1111) (expected: 2026/27).
+
+## Understat xG join rate
+
+Played matches (FTR present) in E0/SP1/D1/I1/F1 from 2014/15, joined to Understat team-match xG (`match_xg` table). Join key: (div, UK-local date, canonical home, canonical away); fallback on (div, season, home, away) when Understat's date is within 3 days and the full-time score agrees (152 of 21836 rows use the fallback).
+
+Overall: 21836/21839 = 99.99%
+
+| season | D1 | E0 | F1 | I1 | SP1 |
+|---|---|---|---|---|---|
+| 2014/15 | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| 2015/16 | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| 2016/17 | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| 2017/18 | 100.0% | 100.0% | 99.7% | 100.0% | 100.0% |
+| 2018/19 | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| 2019/20 | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| 2020/21 | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| 2021/22 | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| 2022/23 | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| 2023/24 | 100.0% | 100.0% | 100.0% | 99.7% | 100.0% |
+| 2024/25 | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| 2025/26 | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| 2026/27 | 100.0% | 100.0% | 97.8% | 100.0% | 100.0% |
+| **all** | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+
+League-seasons below 98%: 1
+- F1 2026/27: 44/45 (97.8%)
