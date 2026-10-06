@@ -949,3 +949,63 @@ def test_connect_migrates_a_raw_clv_ledger_to_net_clv(tmp_path):
         except Exception:  # noqa: BLE001 - already closed above
             pass
 
+
+
+# ------------------------------------------------------------------ P6 leftovers (t_1e550b87)
+def test_effective_limits_uses_the_strategy_kelly_capped_by_limits():
+    lim = risk.Limits(kelly_fraction=0.25)
+    assert risk.effective_limits(lim, {"kelly_fraction": 0.1}).kelly_fraction == 0.1
+    assert risk.effective_limits(lim, {"kelly_fraction": 0.5}).kelly_fraction == 0.25
+    assert risk.effective_limits(lim, {}).kelly_fraction == 0.25
+    with pytest.raises(ValueError):
+        risk.effective_limits(lim, {"kelly_fraction": 1.5})
+    cfg = picks.load_strategy(ROOT / "config" / "strategy.toml")
+    assert risk.effective_limits(risk.load_limits(ROOT / "config" / "limits.toml"), cfg)
+
+
+def test_insert_bets_survives_a_duplicate_inside_one_batch(conn):
+    out = ledger.insert_bets(conn, [_bet("k0"), _bet("k0"), _bet("k1")])
+    assert [b["match_key"] for b in out] == ["k0", "k1"]
+    assert len(ledger.read_table(conn, "bets")) == 2
+
+
+def test_insert_bets_rechecks_the_daily_allowance_inside_the_transaction(conn):
+    # another run already wrote 2 bets today after this run read its allowance
+    ledger.insert_bets(conn, [_bet("k0"), _bet("k1")])
+    out = ledger.insert_bets(conn, [_bet("k2"), _bet("k3"), _bet("k4")], daily_cap=3)
+    assert [b["match_key"] for b in out] == ["k2"]
+    assert ledger.bets_placed_on(conn, "2026-10-06") == 3
+
+
+def test_blank_time_is_start_of_day_and_flagged_unknown(tmp_path):
+    p = _fixture_csv(
+        tmp_path / "fixtures.csv",
+        [{"Div": "E2", "Date": "01/11/2027", "Time": "", "HomeTeam": "Burton",
+          "AwayTeam": "Huddersfield"}],
+    )
+    fix = fx.parse_fixtures(fx.read_fixture_csv(p))
+    assert fix.loc[0, "kickoff_utc"].isoformat() == "2027-11-01T00:00:00+00:00"
+    assert bool(fix.loc[0, "time_unknown"])
+
+
+def test_format_digest_accepts_naive_timestamps():
+    bet = {**_bet("k0"), "kickoff_utc": "2027-11-01 15:00:00"}
+    text = picks.format_digest([bet], {"mode": "shadow"}, pd.Timestamp("2027-11-01 08:00:00"))
+    assert "Huddersfield" in text
+
+
+def test_market_rows_aligns_on_raw_rows_when_parse_drops_rows(tmp_path):
+    p = _fixture_csv(
+        tmp_path / "fixtures.csv",
+        [
+            {"Div": "E2", "Date": "", "Time": "15:00", "HomeTeam": "X", "AwayTeam": "Y",
+             "BFEH": 9.0, "BFED": 9.0, "BFEA": 9.0},  # dropped: no date
+            {"Div": "E2", "Date": "01/11/2027", "Time": "15:00", "HomeTeam": "Burton",
+             "AwayTeam": "Huddersfield", "BFEH": 4.0, "BFED": 3.9, "BFEA": 2.0},
+        ],
+    )
+    raw = fx.read_fixture_csv(p)
+    fix = fx.parse_fixtures(raw)
+    rows = fx.market_rows(raw, fix, phase="pre", markets=("1x2",))
+    assert len(rows) == 3
+    assert rows[rows["selection"] == "H"]["price"].iloc[0] == 4.0

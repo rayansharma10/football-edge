@@ -76,7 +76,7 @@ def main(argv=None) -> int:
     now = pd.Timestamp.now(tz="UTC")
 
     strategy = picks.load_strategy(args.config)
-    limits = risk.load_limits(args.limits)
+    limits = risk.effective_limits(risk.load_limits(args.limits), strategy)
     conn = ledger.connect(ledger.default_path(args.data_dir))
     state = risk.daily_state(conn, limits, args.data_dir, mode=str(strategy["mode"]))
 
@@ -157,7 +157,7 @@ def main(argv=None) -> int:
         return 0
 
     n_snap = ledger.insert_snapshots(conn, snapshots)
-    inserted = ledger.insert_bets(conn, bets)
+    inserted = ledger.insert_bets(conn, bets, daily_cap=limits.max_bets_per_day)
     if state["blocked"]:
         print(f"paper_picks: no bets placed: {state['reason']}", file=sys.stderr)
     if inserted:

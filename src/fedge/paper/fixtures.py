@@ -134,8 +134,11 @@ def parse_fixtures(raw: pd.DataFrame) -> pd.DataFrame:
     df, local, hm, aw = df[ok], local[ok], hm[ok], aw[ok]
     t = df["Time"].astype("string").str.strip()
     t_ok = t.str.match(r"^\d{1,2}:\d{2}$").fillna(False).astype(bool)
-    hh = pd.to_numeric(t.str.split(":").str[0].where(t_ok), errors="coerce").fillna(23)
-    mm = pd.to_numeric(t.str.split(":").str[1].where(t_ok), errors="coerce").fillna(59)
+    # n1: a blank Time is treated as 00:00 UK. The ingest layer puts unknown times late in the day
+    # (right for backtests: no lookahead), but for a live desk that kept the fixture "upcoming"
+    # all day; the early guess means we never bet a match that may already have started.
+    hh = pd.to_numeric(t.str.split(":").str[0].where(t_ok), errors="coerce").fillna(0)
+    mm = pd.to_numeric(t.str.split(":").str[1].where(t_ok), errors="coerce").fillna(0)
     local_dt = local.dt.normalize() + pd.to_timedelta(hh, unit="h") + pd.to_timedelta(mm, unit="m")
     date_str = local.dt.strftime("%Y-%m-%d")
     out = pd.DataFrame(
@@ -143,6 +146,7 @@ def parse_fixtures(raw: pd.DataFrame) -> pd.DataFrame:
             "div": df["Div"].to_numpy(),
             "date": date_str.to_numpy(),
             "time": t.where(t_ok, "").to_numpy(),
+            "time_unknown": (~t_ok).to_numpy(),
             "home": hm.to_numpy(),
             "away": aw.to_numpy(),
             "kickoff_utc": uk_local_to_utc(local_dt.reset_index(drop=True)).to_numpy(),
@@ -153,7 +157,9 @@ def parse_fixtures(raw: pd.DataFrame) -> pd.DataFrame:
         make_match_id(d, s, h, a)
         for d, s, h, a in zip(out["div"], out["date"], out["home"], out["away"], strict=True)
     ]
-    return out.reset_index(drop=True)
+    out = out.reset_index(drop=True)
+    out.attrs["raw_index"] = list(df.index)
+    return out
 
 
 def market_rows(
@@ -166,7 +172,13 @@ def market_rows(
     """
     if fixtures.empty:
         return _empty_rows()
-    raw = raw.loc[fixtures.index]
+    # n7: ``raw`` keeps the file's row labels and parse_fixtures drops unparseable rows, so the
+    # fixtures' reset index is not the raw index. Align on the raw labels parse_fixtures kept
+    # (``attrs``) instead of assuming the two share a positional index.
+    if "raw_index" in fixtures.attrs:
+        raw = raw.loc[fixtures.attrs["raw_index"]].reset_index(drop=True)
+    else:
+        raw = raw.loc[fixtures.index]
     parts = []
     for market in markets:
         sels = list(SELS[market])
@@ -230,8 +242,8 @@ def parse_new_league(raw: pd.DataFrame) -> pd.DataFrame:
     df, local, hm, aw = df[ok], local[ok], hm[ok], aw[ok]
     t = df["Time"].astype("string").str.strip()
     t_ok = t.str.match(r"^\d{1,2}:\d{2}$").fillna(False).astype(bool)
-    hh = pd.to_numeric(t.str.split(":").str[0].where(t_ok), errors="coerce").fillna(23)
-    mm = pd.to_numeric(t.str.split(":").str[1].where(t_ok), errors="coerce").fillna(59)
+    hh = pd.to_numeric(t.str.split(":").str[0].where(t_ok), errors="coerce").fillna(0)
+    mm = pd.to_numeric(t.str.split(":").str[1].where(t_ok), errors="coerce").fillna(0)
     local_dt = local.dt.normalize() + pd.to_timedelta(hh, unit="h") + pd.to_timedelta(mm, unit="m")
     has_bfe = (
         df[["BFEH", "BFED", "BFEA"]].apply(pd.to_numeric, errors="coerce").notna().all(axis=1)
@@ -252,7 +264,7 @@ def parse_new_league(raw: pd.DataFrame) -> pd.DataFrame:
 
 def _empty_fixtures() -> pd.DataFrame:
     return pd.DataFrame(
-        columns=["div", "date", "time", "home", "away", "kickoff_utc", "match_key"]
+        columns=["div", "date", "time", "time_unknown", "home", "away", "kickoff_utc", "match_key"]
     )
 
 

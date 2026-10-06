@@ -62,7 +62,10 @@ def metrics(settled: pd.DataFrame, limits: risk.Limits) -> dict:
         market_id=settled["match_key"] + "|" + settled["market"],
         won=settled["settled_won"].astype(bool),
     )
-    _, flat = simulate_bankroll(sim, mode="flat", max_stake_frac=limits.max_stake_frac,
+    # n6: the flat comparison stakes 10u, but never above the desk's own max_stake_frac cap
+    flat_stake = min(10.0, limits.max_stake_frac * risk.BANKROLL0)
+    _, flat = simulate_bankroll(sim, mode="flat", flat_stake=flat_stake,
+                                max_stake_frac=limits.max_stake_frac,
                                 commission=limits.commission)
     _, kelly = simulate_bankroll(
         sim, mode="kelly", kelly_mult=limits.kelly_fraction, max_stake_frac=limits.max_stake_frac,
@@ -144,8 +147,9 @@ def build_report(
         "",
         f"- {clv_text(m)}",
         f"- Flat ROI {fmt(m.get('roi_flat'))} on {fmt(m.get('turnover'), pct=False)}u turnover; "
-        f"Kelly({limits.kelly_fraction:g}) ROI {fmt(m.get('roi_kelly'))}",
-        f"- Max drawdown: Kelly {fmt_dd(m.get('max_drawdown'))} / flat {fmt_dd(m.get('mdd_flat'))}",
+        f"counterfactual Kelly({limits.kelly_fraction:g}) ROI {fmt(m.get('roi_kelly'))}",
+        f"- Max drawdown: counterfactual Kelly {fmt_dd(m.get('max_drawdown'))} / "
+        f"flat {fmt_dd(m.get('mdd_flat'))}",
         f"- Paper only: n={m_paper.get('n', 0)}, {clv_text(m_paper)}",
         f"- Shadow only: n={m_shadow.get('n', 0)}, {clv_text(m_shadow)}",
         "",
@@ -187,9 +191,15 @@ def build_report(
         f"kickoff is in the future; the shadow edge threshold is "
         f"{strategy['shadow_threshold']:.2%}.",
         "- Stakes are a fixed fraction of the starting 1000u bankroll (not compounded on the "
-        "ledger's running balance). The Kelly ROI column is the backtest's compounding Kelly, so "
-        "`flat ROI` is the number that matches `stake_units`; treat the Kelly figure as a "
-        "sizing-rule comparison, not as the ledger's P&L.",
+        "ledger's running balance). The Kelly ROI and Kelly drawdown are COUNTERFACTUAL: the "
+        "backtest's compounding Kelly applied to the settled bets, not what the desk staked. "
+        "`flat ROI` is the number that matches `stake_units`; treat the Kelly figures as a "
+        "sizing-rule comparison, not as the ledger's P&L. The Kelly fraction is the strategy's "
+        "in-fold value capped by `limits.toml` (one source of truth, m5).",
+        "- Snapshot coverage is partial: a fixture is only scored when its division is modelled, "
+        "it has a complete price book from some source and its kickoff is still in the future "
+        "(24 of 46 listed rows on one recent day), so the snapshot table is not every fixture "
+        "football-data lists.",
         "- The drawdown kill switch gates `paper` bets only. Shadow bets carry no money and "
         "blocking them on a hypothetical drawdown would freeze evidence collection.",
         "",
@@ -220,7 +230,7 @@ def format_summary(summary: dict, strategy: dict, limits: risk.Limits) -> str:
         f"({summary['settled']} settled: {summary['settled_paper']} paper / "
         f"{summary['settled_shadow']} shadow) | snapshots {summary['snapshots']} | "
         f"mean net log-CLV {clv} (n={summary['clv_n']}) | flat ROI {roi}, "
-        f"Kelly({limits.kelly_fraction:g}) ROI {kroi} | "
+        f"counterfactual Kelly({limits.kelly_fraction:g}) ROI {kroi} | "
         f"Gate 1 {summary['settled_paper']}/{GATE1_BETS}"
     )
 
@@ -228,7 +238,7 @@ def format_summary(summary: dict, strategy: dict, limits: risk.Limits) -> str:
 def main(argv=None) -> int:
     args = parse_args(argv)
     strategy = picks.load_strategy(args.config)
-    limits = risk.load_limits(args.limits)
+    limits = risk.effective_limits(risk.load_limits(args.limits), strategy)
     conn = ledger.connect(ledger.default_path(args.data_dir))
     now = pd.Timestamp(args.now) if args.now else pd.Timestamp.now(tz="UTC")
     now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")

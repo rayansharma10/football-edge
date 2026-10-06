@@ -9,7 +9,10 @@ Enforced here:
 * ``config/limits.toml`` is parsed and ``LIVE = true`` is a hard error, so a mis-edited config
   stops the desk instead of silently enabling live betting.
 * Stake size is ``kelly_fraction * full Kelly`` on commission-adjusted odds, capped at
-  ``max_stake_frac`` of the bankroll (``limits.toml``).
+  ``max_stake_frac`` of the bankroll (``limits.toml``). ``kelly_fraction`` is the strategy's
+  in-fold value capped by ``limits.toml`` (:func:`effective_limits`).
+* Stakes are a fixed fraction of the constant ``BANKROLL0``: the desk does not compound on the
+  ledger's realised bankroll (the weekly report labels its Kelly columns counterfactual).
 * At most ``max_bets_per_day`` bets are written per UTC day; the picker sorts by edge and takes the
   top of the list.
 * The kill-switch file (``data/KILL``) blocks every new bet while it exists. A realised drawdown
@@ -20,7 +23,7 @@ Enforced here:
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -72,6 +75,22 @@ def load_limits(path: Path | str = DEFAULT_LIMITS) -> Limits:
     if limits.max_bets_per_day < 1:
         raise ValueError(f"{path}: max_bets_per_day must be >= 1")
     return limits
+
+
+def effective_limits(limits: Limits, strategy: dict) -> Limits:
+    """Limits with ONE Kelly fraction: the in-fold strategy value, never above the limits cap (m5).
+
+    ``config/strategy.toml`` carries the Kelly fraction selected in-fold (AGENTS.md rule 4) and
+    ``config/limits.toml`` carries a risk ceiling. The desk stakes, and the weekly report labels,
+    ``min(strategy, limits)``; a strategy without a ``kelly_fraction`` falls back to the cap.
+    """
+    k = strategy.get("kelly_fraction")
+    if k is None:
+        return limits
+    k = float(k)
+    if not 0.0 <= k <= 1.0:
+        raise ValueError(f"strategy kelly_fraction must be in [0, 1], got {k}")
+    return replace(limits, kelly_fraction=min(k, limits.kelly_fraction))
 
 
 def kill_path(data_dir: Path | str = "data") -> Path:
@@ -131,6 +150,10 @@ def daily_state(
     Returns ``{'today', 'placed_today', 'remaining', 'drawdown', 'blocked', 'reason'}``. ``blocked``
     is True for the kill-switch file or a realised drawdown at/over ``drawdown_kill``; ``remaining``
     is how many more bets may be written today (0 when blocked).
+
+    The count is a snapshot taken before a multi-minute run; the binding check is the one inside
+    the insert transaction (``ledger.insert_bets(..., daily_cap=...)``), so two overlapping runs
+    cannot both hand out the full allowance (m9).
 
     ``mode`` scopes the drawdown to one ledger (``paper``/``shadow``). Shadow bets are hypotheses
     with no money at risk, and blocking them on a hypothetical drawdown would freeze the evidence

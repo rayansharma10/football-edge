@@ -56,6 +56,10 @@ def wide_prices(odds: pd.DataFrame, book: str, market: str, phase: str) -> pd.Da
 
     Rows with a non-positive/nonsense quote (``<= 1.0``) are dropped: one bad quote would otherwise
     make the de-vig raise and abort the whole settlement run (m8).
+
+    Assumes the ingest layer already de-duplicated the odds table to one row per (match_id, book,
+    market, phase, selection): the pivot takes ``aggfunc="first"`` and so would silently pick an
+    arbitrary row of a duplicate pair (n9).
     """
     sels = list(SELS[market])
     o = odds.loc[

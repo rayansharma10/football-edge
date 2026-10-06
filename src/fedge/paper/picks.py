@@ -252,7 +252,7 @@ def snapshot_rows(edges: pd.DataFrame, fixtures: pd.DataFrame, now_utc) -> list[
 def format_digest(bets: list[dict], strategy: dict, now_utc) -> str:
     """The Slack-ready digest: header line, then one line per new bet (Sydney kickoff time)."""
     mode = str(strategy["mode"])
-    day = pd.Timestamp(now_utc).tz_convert(SYDNEY).strftime("%Y-%m-%d %H:%M %Z")
+    day = _utc(now_utc).tz_convert(SYDNEY).strftime("%Y-%m-%d %H:%M %Z")
     gate = (
         f"Gate 0 parked the whitelist (mode={mode})"
         if mode != "paper"
@@ -261,7 +261,7 @@ def format_digest(bets: list[dict], strategy: dict, now_utc) -> str:
     head = f"fedge {mode} picks {day} | {len(bets)} new bet(s) | {gate}"
     lines = [head]
     for b in bets:
-        ko = pd.Timestamp(b["kickoff_utc"]).tz_convert(SYDNEY).strftime("%a %d %b %H:%M %Z")
+        ko = _utc(b["kickoff_utc"]).tz_convert(SYDNEY).strftime("%a %d %b %H:%M %Z")
         lines.append(
             f"  {ko} | {b['div']} | {b['home']} v {b['away']} | {b['selection']} @ "
             f"{b['price_taken']:.2f} ({b['price_source']}) | edge {b['edge'] * 100:+.1f}% | "
@@ -272,12 +272,17 @@ def format_digest(bets: list[dict], strategy: dict, now_utc) -> str:
     return "\n".join(lines)
 
 
-def _iso(ts) -> str:
-    """tz-aware UTC ISO-8601 string."""
+def _utc(ts) -> pd.Timestamp:
+    """tz-aware UTC Timestamp; a naive input is taken to be UTC (n2)."""
     t = pd.Timestamp(ts)
     if t.tzinfo is None:
-        t = t.tz_localize("UTC")
-    return t.tz_convert("UTC").isoformat()
+        return t.tz_localize("UTC")
+    return t.tz_convert("UTC")
+
+
+def _iso(ts) -> str:
+    """tz-aware UTC ISO-8601 string."""
+    return _utc(ts).isoformat()
 
 
 def _f(v):

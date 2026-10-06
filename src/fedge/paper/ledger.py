@@ -197,27 +197,48 @@ def _migrate(conn: sqlite3.Connection, commission: float = 0.06) -> None:
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
-def insert_bets(conn: sqlite3.Connection, rows: Iterable[dict]) -> list[dict]:
+def insert_bets(
+    conn: sqlite3.Connection, rows: Iterable[dict], daily_cap: int | None = None
+) -> list[dict]:
     """Insert bets, skipping any (match, market, selection) already recorded.
 
     Returns the subset of ``rows`` that was actually written, so callers can report only genuinely
     new bets (idempotency: re-running the picker with the same fixtures writes nothing).
+
+    Runs in one ``BEGIN IMMEDIATE`` transaction with ``INSERT OR IGNORE`` per row, so a duplicate
+    inside one batch or a concurrent insert is skipped instead of raising ``IntegrityError`` (n3).
+    With ``daily_cap`` the allowance is re-checked inside that transaction against the bets
+    already stored for each row's UTC ``created_utc`` day, so overlapping runs cannot each hand
+    out the full allowance (m9). Rows are taken in the order given (the picker sorts by edge).
     """
     rows = list(rows)
     if not rows:
         return []
-    keys = {(r["match_key"], r["market"], r["selection"]) for r in rows}
-    have = existing_triples(conn, keys)
-    fresh = [r for r in rows if (r["match_key"], r["market"], r["selection"]) not in have]
-    if not fresh:
-        return []
-    conn.executemany(
-        f"INSERT INTO bets ({', '.join(BET_COLUMNS)}) "
-        f"VALUES ({', '.join('?' * len(BET_COLUMNS))})",
-        [tuple(r[c] for c in BET_COLUMNS) for r in fresh],
-    )
-    conn.commit()
-    return fresh
+    conn.commit()  # BEGIN IMMEDIATE needs no open transaction
+    conn.execute("BEGIN IMMEDIATE")
+    written: list[dict] = []
+    try:
+        placed: dict[str, int] = {}
+        sql = (
+            f"INSERT OR IGNORE INTO bets ({', '.join(BET_COLUMNS)}) "
+            f"VALUES ({', '.join('?' * len(BET_COLUMNS))})"
+        )
+        for r in rows:
+            day = str(r["created_utc"])[:10]
+            if daily_cap is not None:
+                if day not in placed:
+                    placed[day] = bets_placed_on(conn, day)
+                if placed[day] >= daily_cap:
+                    continue
+            cur = conn.execute(sql, tuple(r[c] for c in BET_COLUMNS))
+            if cur.rowcount == 1:
+                written.append(r)
+                placed[day] = placed.get(day, 0) + 1
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return written
 
 
 def existing_triples(conn: sqlite3.Connection, triples: Iterable[tuple[str, str, str]]) -> set:
