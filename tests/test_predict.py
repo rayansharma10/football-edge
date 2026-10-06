@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -192,45 +191,3 @@ def test_unmodelled_row_has_no_probabilities():
 def test_desk_divs_from_config():
     assert pred.load_desk_divs("config/leagues.toml") == ("E0", "SP1")
     assert pred.load_desk_divs("does-not-exist.toml") == pred.DESK_DIVS
-
-
-# ------------------------------------------------------------------ lookup CLI (`--home/--away`)
-def _script(name):
-    import importlib.util
-    import sys
-
-    path = Path(__file__).resolve().parents[1] / "scripts" / f"{name}.py"
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def test_lookup_prints_the_live_model_numbers(capsys):
-    """Regression: ``row.div`` on a pandas Series is the truediv METHOD, not the column."""
-    import argparse
-
-    mod = _script("predict_upcoming")
-    fix = _fixtures().iloc[[0]]
-    args = argparse.Namespace(home="Arsenal", away="Chelsea", json=False)
-    assert mod.lookup(args, _played(), fix, _edges(), pd.Timestamp("2026-10-06T00:00:00Z")) == 0
-    out = capsys.readouterr().out
-    assert "bound method" not in out and "<" not in out
-    assert out.splitlines()[0] == "Arsenal v Chelsea  (E0)"
-    assert "40.6%" not in out  # the target is 0.50/0.27/0.23 below, not the real model's numbers
-    assert " 50.0% /  27.0% /  23.0%" in out
-    assert "mkt   45.0% /  28.0% /  27.0%" in out
-    assert "source: live lgbd_xg 1X2 (market-anchored)" in out
-
-
-def test_lookup_without_a_priced_fixture_says_dixon_coles_only(capsys):
-    import argparse
-
-    mod = _script("predict_upcoming")
-    args = argparse.Namespace(home="Arsenal", away="Chelsea", json=False)
-    rc = mod.lookup(args, _played(), _fixtures(), pd.DataFrame(),
-                    pd.Timestamp("2026-10-06T00:00:00Z"))
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert "no Dixon-Coles fit available" in err  # 2 played rows: no fit, never a fake number

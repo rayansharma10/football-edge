@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Football predictions - Accuracy</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <div class="topbar">
+    <h1>Football predictions</h1>
+    <nav class="tabs"><a href="/">Upcoming</a><a href="/accuracy" class="on">Accuracy</a></nav>
+    <span class="stamp" id="upd">loading&hellip;</span>
+  </div>
+
+  <p class="intro">
+    How good are the predictions? Every Premier League and La Liga prediction (winner and scoreline)
+    is saved before kick-off and never edited. When the match finishes it is compared with the real
+    result. Numbers below are model-only: no bookmaker prices are used or shown.
+  </p>
+
+  <label class="toggle"><input type="checkbox" id="retro"> Include retrospective predictions
+    <span class="mute">(made after the fact with a model that only saw earlier matches &mdash; not live)</span></label>
+  <div id="note"></div>
+
+  <div id="empty" hidden></div>
+  <div id="body" hidden>
+    <section><div class="cards4" id="cards"></div></section>
+
+    <section>
+      <h2>Recent predictions vs results</h2>
+      <div class="card tablewrap" id="recent"></div>
+    </section>
+
+    <section class="cols">
+      <div class="card"><h2>Cumulative accuracy</h2><div id="cum"></div>
+        <div class="legend" id="cumLegend"></div></div>
+      <div class="card"><h2>Calibration</h2><div id="calib"></div>
+        <div class="legend">When the model says 30%, does it happen about 30% of the time? Dots on the diagonal mean yes. Dot size shows how many predictions fall in that bin.</div></div>
+    </section>
+
+    <section>
+      <h2>Splits</h2>
+      <div class="card tablewrap" id="splits"></div>
+    </section>
+
+    <section>
+      <h2>Scoreline and goal markets</h2>
+      <div class="card tablewrap" id="score"></div>
+    </section>
+
+    <section>
+      <h2>Compared with simple baselines</h2>
+      <div class="card tablewrap" id="base"></div>
+    </section>
+
+    <section>
+      <h2>What the numbers mean</h2>
+      <div class="card legendbox">
+        <p><b>Winner hit rate</b> &ndash; how often the most likely outcome (home win, draw or away win) was right. Football is noisy: even strong models land around 50&ndash;55%.</p>
+        <p><b>Exact-score hit rate</b> &ndash; how often the predicted scoreline was exactly right. This is inherently hard: the single most likely score only has a ~10&ndash;12% chance, so expect roughly 1 in 9 at best. The predicted score is always the most likely score <i>within</i> the predicted winner, so score and winner agree.</p>
+        <p><b>Top-3 / top-5</b> &ndash; the actual score was among the model&rsquo;s 3 or 5 most likely scorelines. <b>Goal difference</b> &ndash; right margin (e.g. 2-1 predicted, 3-2 happened).</p>
+        <p><b>Brier score</b> &ndash; average squared error of the W/D/L probabilities (lower is better; always guessing 33/33/33 scores about 0.667). <b>Log-loss</b> &ndash; how surprised the model was by what happened (lower is better; 1.099 = a 33/33/33 guess). <b>RPS</b> &ndash; like Brier but respects the order home&lt;draw&lt;away (lower is better).</p>
+        <p><b>Calibration</b> &ndash; are the percentages honest? <b>MAE goals</b> &ndash; average gap between expected goals and goals scored. <b>Score probability</b> &ndash; the average log of the chance the model gave the real scoreline (higher, i.e. closer to 0, is better). <b>Over 2.5 / BTTS</b> &ndash; accuracy and Brier of the goal-market probabilities.</p>
+        <p><b>Baselines</b> &ndash; always-home, league-average results, league-average scoreline and a naive Poisson from last season&rsquo;s goal rates, scored on the same matches. A useful model should beat them.</p>
+        <p><b>d7 / d3 / final</b> &ndash; the first prediction made at least 7 days / 3 days before kick-off, and the last one before kick-off. &ldquo;Hours before&rdquo; shows how early each really was. <b>95% range</b> is a bootstrap interval; with fewer than 100 matches treat every number as a rough guide.</p>
+      </div>
+    </section>
+  </div>
+
+  <footer>Predictions are logged by scripts/predict_upcoming.py, results by scripts/update_results.py. This page is read-only.</footer>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const pct = (v, d=1) => v == null ? "-" : (v*100).toFixed(d) + "%";
+const num = (v, d=3) => v == null ? "-" : Number(v).toFixed(d);
+const rng = (ci, d=0) => ci && ci[0] != null ? `<span class="mute">(${pct(ci[0], d)}&ndash;${pct(ci[1], d)})</span>` : "";
+const small = m => m && m.small_sample ? ` <span class="warnchip" title="fewer than 100 matches">small sample</span>` : "";
+const L = {E0: "Premier League", SP1: "La Liga"};
+const tick = ok => ok ? `<span class="good">&#10003;</span>` : `<span class="bad">&#10007;</span>`;
+
+function ko(iso) {
+  const d = new Date(iso); if (isNaN(d)) return esc(iso);
+  return d.toLocaleDateString("en-AU", {timeZone: "Australia/Sydney", day: "numeric", month: "short"});
+}
+
+function cards(h, n, retro) {
+  const w = h.winner, s = h.score, b = h.baselines || {};
+  const f = b.league_freq || {}, ah = b.always_home || {};
+  const card = (t, big, sub) => `<div class="card stat"><div class="t">${t}</div><div class="big">${big}</div><div class="sub">${sub}</div></div>`;
+  $("cards").innerHTML = [
+    card("Matches scored", n + small(h), `${retro ? "live + retrospective" : "live only"}; winner and score checked against the real result`),
+    card("Winner hit rate", pct(w.hit_rate), `95% range ${rng(w.hit_rate_ci)}<br>league-average guess ${pct(f.winner_hit_rate)} &middot; always home ${pct(ah.winner_hit_rate)}`),
+    card("Exact-score hit rate", pct(s.exact_hit_rate), `95% range ${rng(s.exact_hit_rate_ci)}<br>league-average score ${pct(f.exact_hit_rate)} &middot; last-season Poisson ${pct((b.prev_season_poisson||{}).exact_hit_rate)}`),
+    card("Brier &middot; log-loss", `${num(w.brier)} &middot; ${num(w.log_loss)}`, `lower is better<br>baseline (league avg) ${num(f.brier)} &middot; ${num(f.log_loss)}`),
+  ].join("");
+}
+
+function recent(rows) {
+  if (!rows || !rows.length) { $("recent").innerHTML = `<div class="empty">No finished matches yet.</div>`; return; }
+  $("recent").innerHTML = `<table><thead><tr><th>Date</th><th>Match</th><th>Predicted</th><th class="n">Home / Draw / Away</th><th>Actual</th><th>Winner</th><th>Exact</th></tr></thead><tbody>` +
+    rows.map(r => `<tr>
+      <td>${ko(r.kickoff_utc)}</td>
+      <td>${esc(r.home)} <span class="mute">v</span> ${esc(r.away)}${r.source === "retro" ? ` <span class="retro" title="retrospective, not live">retro</span>` : ""}<div class="mute sm">${esc(L[r.div] || r.league)}</div></td>
+      <td><b>${r.pred_score[0]}&ndash;${r.pred_score[1]}</b> <span class="mute">${r.pred_outcome}</span></td>
+      <td class="n">${pct(r.probs.home,0)} / ${pct(r.probs.draw,0)} / ${pct(r.probs.away,0)}</td>
+      <td><b>${r.actual_score[0]}&ndash;${r.actual_score[1]}</b></td>
+      <td>${tick(r.winner_ok)}</td><td>${tick(r.exact_ok)}</td></tr>`).join("") + `</tbody></table>` +
+    `<div class="legend">Newest first. <span class="retro">retro</span> = retrospective (not live). Predicted score is the most likely score within the predicted winner; ticks compare winner and exact score with the real result.</div>`;
+}
+
+/* ---------------------------------------------------------------- inline SVG charts */
+function svgLine(series, opts) {
+  const W = 420, H = 230, m = {l: 40, r: 12, t: 10, b: 28};
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const n = Math.max(...series.map(s => s.pts.length));
+  const ymax = opts.ymax, x = i => m.l + (n <= 1 ? iw/2 : i / (n - 1) * iw), y = v => m.t + ih - (v / ymax) * ih;
+  let g = "";
+  for (let t = 0; t <= 4; t++) { const v = ymax * t / 4; g += `<line x1="${m.l}" x2="${W-m.r}" y1="${y(v)}" y2="${y(v)}" class="grid"/><text x="${m.l-6}" y="${y(v)+4}" class="ax" text-anchor="end">${(v*100).toFixed(0)}%</text>`; }
+  g += `<text x="${m.l}" y="${H-8}" class="ax">1</text><text x="${W-m.r}" y="${H-8}" class="ax" text-anchor="end">${n} matches</text>`;
+  series.forEach(s => {
+    const pts = s.pts.map((v, i) => v == null ? null : `${x(i).toFixed(1)},${y(v).toFixed(1)}`).filter(Boolean);
+    if (pts.length > 1) g += `<polyline points="${pts.join(" ")}" fill="none" stroke="var(--${s.color})" stroke-width="2"${s.dash ? ' stroke-dasharray="5 4"' : ""}/>`;
+    else if (pts.length === 1) { const [px, py] = pts[0].split(","); g += `<circle cx="${px}" cy="${py}" r="3" fill="var(--${s.color})"/>`; }
+  });
+  return `<svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="${esc(opts.label)}">${g}</svg>`;
+}
+
+function cumulative(c) {
+  if (!c || !c.length) { $("cum").innerHTML = `<div class="empty">Nothing yet.</div>`; return; }
+  const ymax = Math.min(1, Math.max(0.2, Math.ceil(Math.max(...c.map(p => p.winner_cum), ...c.map(p => p.baseline_winner_cum ?? 0)) * 10 + 1) / 10));
+  $("cum").innerHTML = svgLine([
+    {pts: c.map(p => p.winner_cum), color: "accent"},
+    {pts: c.map(p => p.baseline_winner_cum), color: "mutec", dash: true},
+    {pts: c.map(p => p.exact_cum), color: "away"},
+  ], {ymax, label: "Cumulative winner and exact-score hit rate"});
+  $("cumLegend").innerHTML = `<span class="key accent"></span> winner hit rate <span class="key mutec"></span> league-average baseline <span class="key away"></span> exact score. Running average in kick-off order; it bounces around early on.`;
+}
+
+function calibration(rows) {
+  const W = 300, H = 260, m = 36, iw = W - m - 10, ih = H - m - 10;
+  const x = v => m + v * iw, y = v => 10 + ih - v * ih;
+  let g = `<line x1="${x(0)}" y1="${y(0)}" x2="${x(1)}" y2="${y(1)}" class="diag"/>`;
+  for (let t = 0; t <= 4; t++) { const v = t / 4; g += `<line x1="${m}" x2="${W-10}" y1="${y(v)}" y2="${y(v)}" class="grid"/><text x="${m-5}" y="${y(v)+4}" class="ax" text-anchor="end">${(v*100).toFixed(0)}%</text><text x="${x(v)}" y="${H-10}" class="ax" text-anchor="middle">${(v*100).toFixed(0)}%</text>`; }
+  const maxn = Math.max(...rows.map(r => r.n), 1);
+  rows.filter(r => r.n > 0).forEach(r => {
+    const rad = 3 + 7 * Math.sqrt(r.n / maxn);
+    g += `<circle cx="${x(r.mean_pred)}" cy="${y(r.observed)}" r="${rad.toFixed(1)}" class="dotc"><title>predicted ${pct(r.mean_pred)} / happened ${pct(r.observed)} (${r.n} outcomes)</title></circle>`;
+  });
+  g += `<text x="${(m + W) / 2}" y="${H-1}" class="ax" text-anchor="middle">predicted probability</text>`;
+  $("calib").innerHTML = `<svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="Calibration chart">${g}</svg>`;
+}
+
+function splits(rep) {
+  const row = (label, m, extra="") => m && m.n ? `<tr><td>${esc(label)}${small(m)}</td><td class="n">${m.n}</td><td class="n">${extra}</td><td class="n">${pct(m.winner.hit_rate)} ${rng(m.winner.hit_rate_ci)}</td><td class="n">${pct(m.score.exact_hit_rate)}</td><td class="n">${num(m.winner.brier)}</td><td class="n">${num(m.winner.log_loss)}</td></tr>` : "";
+  const head = first => `<thead><tr><th>${first}</th><th class="n">Matches</th><th class="n">Avg hours before</th><th class="n">Winner hit</th><th class="n">Exact score</th><th class="n">Brier</th><th class="n">Log-loss</th></tr></thead>`;
+  const hrs = m => m && m.mean_hours_before_kickoff != null ? m.mean_hours_before_kickoff.toFixed(0) + "h" : "-";
+  const kinds = {d7: "d7 (first run 7+ days out)", d3: "d3 (first run 3+ days out)", final: "final (last before kick-off)"};
+  let h = `<h3>By league</h3><table>${head("League")}<tbody>` + Object.entries(rep.by_league || {}).map(([k, m]) => row(k, m, hrs(m))).join("") + `</tbody></table>`;
+  h += `<h3>d7 vs d3 vs final <span class="mute sm">(does accuracy improve closer to kick-off?)</span></h3><table>${head("Snapshot")}<tbody>` + Object.entries(kinds).map(([k, t]) => row(t, (rep.by_kind || {})[k], hrs((rep.by_kind || {})[k]))).join("") + `</tbody></table>`;
+  const cm = rep.by_kind_common || {};
+  if (cm.final && cm.final.n) {
+    h += `<h3>Same matches only <span class="mute sm">(matches that have all three snapshots, so the comparison is like-for-like)</span></h3><table>${head("Snapshot")}<tbody>` + Object.entries(kinds).map(([k, t]) => row(t, cm[k], hrs(cm[k]))).join("") + `</tbody></table>`;
+  } else {
+    h += `<div class="legend">No match has all three snapshots yet, so there is no like-for-like d7/d3/final comparison.</div>`;
+  }
+  h += `<h3>By month</h3><table>${head("Month")}<tbody>` + Object.entries(rep.by_month || {}).map(([k, m]) => row(k, m, hrs(m))).join("") + `</tbody></table>`;
+  $("splits").innerHTML = h;
+}
+
+function scoreTable(h) {
+  const s = h.score, w = h.winner;
+  const r = (a, b, c="") => `<tr><td>${a}</td><td class="n">${b}</td><td class="mute sm">${c}</td></tr>`;
+  $("score").innerHTML = `<table><tbody>` + [
+    r("Exact-score hit rate", `${pct(s.exact_hit_rate)} ${rng(s.exact_hit_rate_ci)}`),
+    r("Actual score in top 3", `${pct(s.top3_hit_rate)} ${rng(s.top3_hit_rate_ci)}`),
+    r("Actual score in top 5", `${pct(s.top5_hit_rate)} ${rng(s.top5_hit_rate_ci)}`),
+    r("Correct goal difference", `${pct(s.goal_diff_hit_rate)} ${rng(s.goal_diff_hit_rate_ci)}`),
+    r("Average goals error (MAE)", `total ${num(s.mae_total_goals, 2)} &middot; home ${num(s.mae_home_goals, 2)} &middot; away ${num(s.mae_away_goals, 2)}`, "expected goals vs goals scored"),
+    r("Chance given to the real scoreline", `${pct(s.mean_actual_score_prob)} avg &middot; log ${num(s.mean_log_score, 2)}`),
+    r("Over 2.5 goals", `${pct(s.over25_accuracy)} right &middot; Brier ${num(s.over25_brier)}`),
+    r("Both teams score", `${pct(s.btts_accuracy)} right &middot; Brier ${num(s.btts_brier)}`),
+    r("RPS", num(w.rps), "lower is better"),
+    r("Draws predicted / actual", `${pct(w.draw_predicted_rate)} / ${pct(w.draw_actual_rate)}`, "models rarely call a draw even though ~1 in 4 matches end level"),
+  ].join("") + `</tbody></table>` + confusion(w.confusion);
+}
+
+function confusion(cm) {
+  const lab = ["Home", "Draw", "Away"];
+  return `<h3>Winner confusion matrix <span class="mute sm">(rows = what happened, columns = what we predicted)</span></h3><table class="cm"><thead><tr><th></th>${lab.map(l => `<th class="n">${l}</th>`).join("")}</tr></thead><tbody>` +
+    cm.map((row, i) => `<tr><td>${lab[i]}</td>${row.map((v, j) => `<td class="n${i === j ? " diag-c" : ""}">${v}</td>`).join("")}</tr>`).join("") + `</tbody></table>`;
+}
+
+function baselines(h) {
+  const b = h.baselines;
+  if (!b) { $("base").innerHTML = `<div class="empty">Baselines need the match history file.</div>`; return; }
+  const names = {model: "Our model", always_home: "Always home win", league_freq: "League-average W/D/L and score", prev_season_poisson: "Last-season goal-rate Poisson"};
+  const rows = [["model", {winner_hit_rate: h.winner.hit_rate, winner_hit_rate_ci: h.winner.hit_rate_ci, brier: h.winner.brier, log_loss: h.winner.log_loss, exact_hit_rate: h.score.exact_hit_rate, mean_log_score: h.score.mean_log_score}], ...Object.entries(b)];
+  $("base").innerHTML = `<table><thead><tr><th>Method</th><th class="n">Winner hit</th><th class="n">Brier</th><th class="n">Log-loss</th><th class="n">Exact score</th><th class="n">Score log-prob</th></tr></thead><tbody>` +
+    rows.map(([k, m]) => `<tr${k === "model" ? ' class="me"' : ""}><td>${names[k]}</td><td class="n">${pct(m.winner_hit_rate)}</td><td class="n">${num(m.brier)}</td><td class="n">${num(m.log_loss)}</td><td class="n">${pct(m.exact_hit_rate)}</td><td class="n">${num(m.mean_log_score, 2)}</td></tr>`).join("") + `</tbody></table>`;
+}
+
+function render(rep) {
+  const c = rep.counts || {live: 0, retro: 0};
+  $("upd").textContent = `${c.live} live + ${c.retro} retrospective scored`;
+  const toggled = $("retro").checked;
+  $("note").innerHTML = toggled && c.retro ? `<div class="notice">Includes ${c.retro} <b>retrospective (not live)</b> predictions. They were made after the matches with a model that only used earlier matches &mdash; useful for a first look, but not a live track record.</div>` : "";
+  if (rep.empty) {
+    $("body").hidden = true; $("empty").hidden = false;
+    $("empty").innerHTML = `<div class="card"><div class="empty">
+      <b>No finished live predictions yet.</b><br><br>
+      Predictions are saved before every kick-off and compared with the final score once the match is over,
+      so this page fills in as the first predicted matches finish.
+      ${c.retro ? `<br><br>${c.retro} retrospective predictions (made after the fact, not live) are available &mdash; tick &ldquo;Include retrospective predictions&rdquo; above to look at them.` : ""}
+    </div></div>`;
+    return;
+  }
+  $("empty").hidden = true; $("body").hidden = false;
+  cards(rep.headline, rep.scored, toggled);
+  recent(rep.recent); cumulative(rep.cumulative); calibration(rep.headline.winner.calibration);
+  splits(rep); scoreTable(rep.headline); baselines(rep.headline);
+}
+
+async function load() {
+  try {
+    const r = await fetch("/api/accuracy?include_retro=" + ($("retro").checked ? 1 : 0), {cache: "no-store"});
+    if (!r.ok) throw new Error("/api/accuracy " + r.status);
+    render(await r.json());
+  } catch (e) {
+    $("upd").innerHTML = `<span class="stale">ERROR</span>`;
+    $("empty").hidden = false; $("body").hidden = true;
+    $("empty").innerHTML = `<div class="card"><div class="empty">Could not load accuracy: ${esc(e.message)}</div></div>`;
+  }
+}
+$("retro").checked = new URLSearchParams(location.search).get("retro") === "1";
+$("retro").addEventListener("change", load);
+load(); setInterval(load, 120000);
+</script>
+</body>
+</html>

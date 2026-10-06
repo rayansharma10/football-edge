@@ -45,7 +45,7 @@ DEFAULT_LOCAL_TIME = "12:00"  # openfootball matches without a time
 RETRIES = 3
 RETRY_SLEEP = 2.0
 MIN_ROWS = 300  # a 20-team league has 380; far fewer means a truncated/failed feed
-COLUMNS = ["div", "home", "away", "kickoff_utc", "round", "played"]
+COLUMNS = ["div", "home", "away", "kickoff_utc", "round", "played", "home_goals", "away_goals"]
 
 
 @dataclass
@@ -115,6 +115,8 @@ def _finish(rows: list[dict], source: str, div: str, unmapped: set[str], overrid
         out.append({**r, "home": h, "away": a})
     df = pd.DataFrame(out, columns=COLUMNS)
     df["kickoff_utc"] = pd.to_datetime(df["kickoff_utc"], utc=True)
+    for c in ("home_goals", "away_goals"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
 
@@ -131,6 +133,7 @@ def parse_fixturedownload(payload: list[dict], div: str) -> list[dict]:
             "div": div, "home": str(h).strip(), "away": str(a).strip(), "kickoff_utc": ts,
             "round": int(m["RoundNumber"]) if m.get("RoundNumber") is not None else None,
             "played": m.get("HomeTeamScore") is not None and m.get("AwayTeamScore") is not None,
+            "home_goals": m.get("HomeTeamScore"), "away_goals": m.get("AwayTeamScore"),
         })
     return rows
 
@@ -155,9 +158,11 @@ def parse_openfootball(payload: dict, div: str) -> list[dict]:
             continue
         digits = "".join(c for c in str(m.get("round", "")) if c.isdigit())
         ft = (m.get("score") or {}).get("ft")
+        has = isinstance(ft, list | tuple) and len(ft) == 2
         rows.append({
             "div": div, "home": str(h).strip(), "away": str(a).strip(), "kickoff_utc": ts,
             "round": int(digits) if digits else None, "played": bool(ft),
+            "home_goals": ft[0] if has else None, "away_goals": ft[1] if has else None,
         })
     return rows
 

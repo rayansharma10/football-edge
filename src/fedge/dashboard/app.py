@@ -11,18 +11,17 @@ import sqlite3
 import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
+
+from fedge.dashboard import telemetry
 
 ROOT = Path(__file__).resolve().parents[3]
 STATIC = Path(__file__).with_name("static")
 
 # A job is "stale" when its last success is older than this many hours.
 STALE_HOURS = {"picks": 14.0, "settle": 30.0}
-# Upcoming-predictions table: refreshed with each picks run (twice a day normally).
-PREDICTIONS_STALE_HOURS = 20.0
 
 
 def _connect_ro(db: Path) -> sqlite3.Connection | None:
@@ -111,10 +110,18 @@ def create_app(root: Path | str = ROOT) -> FastAPI:
     def index():
         return FileResponse(STATIC / "index.html")
 
-    @app.get("/ledger", include_in_schema=False)
-    def ledger_page():
-        """Paper-trading ledger view (the main page shows model predictions only)."""
+    @app.get("/accuracy", include_in_schema=False)
+    def accuracy_page():
+        return FileResponse(STATIC / "accuracy.html")
+
+    @app.get("/archive", include_in_schema=False)
+    def archive_page():
+        """The parked paper-betting ledger (archive; betting is no longer the project's aim)."""
         return FileResponse(STATIC / "ledger.html")
+
+    @app.get("/ledger", include_in_schema=False)
+    def ledger_redirect():
+        return RedirectResponse("/archive", status_code=308)
 
     @app.get("/style.css", include_in_schema=False)
     def stylesheet():
@@ -248,83 +255,7 @@ def create_app(root: Path | str = ROOT) -> FastAPI:
                 c.close()
         return {"rows": rows}
 
-    @app.get("/api/predictions")
-    def predictions():
-        """Upcoming Premier League / La Liga predictions from the ``predictions`` table.
-
-        Written by ``scripts/predict_upcoming.py`` (and the paper-picks run), read-only here.
-        """
-        c = conn()
-        try:
-            rows = _rows(
-                c,
-                "SELECT * FROM predictions ORDER BY kickoff_utc, home",
-            )
-            meta = {m["key"]: m["value"]
-                    for m in _rows(c, "SELECT key, value FROM prediction_meta")}
-        finally:
-            if c:
-                c.close()
-        tz = ZoneInfo("Australia/Sydney")
-        last = None
-        out = []
-        for r in rows:
-            ko = _parse(r["kickoff_utc"])
-            last = max(last, r["run_ts"]) if last else r["run_ts"]
-            try:
-                top = json.loads(r["top_scores"]) if r["top_scores"] else []
-            except ValueError:
-                top = []
-            # Model output only: the market/price columns and the scoreline grid are deliberately
-            # not exposed, because the dashboard shows the model alone (no bookmaker odds).
-            out.append(
-                {
-                    "match_key": r["match_key"],
-                    "status": r["status"],
-                    "reason": r["reason"],
-                    "div": r["div"],
-                    "league": r["league"],
-                    "home": r["home"],
-                    "away": r["away"],
-                    "kickoff_utc": r["kickoff_utc"],
-                    "kickoff_local": (
-                        ko.astimezone(tz).isoformat(timespec="minutes") if ko else None
-                    ),
-                    "probs": None if r["p_home"] is None else {
-                        "home": r["p_home"], "draw": r["p_draw"], "away": r["p_away"],
-                    },
-                    "xg": None if r["xg_home"] is None else {
-                        "home": r["xg_home"], "away": r["xg_away"],
-                    },
-                    "p_over25": r["p_over25"],
-                    "p_btts": r["p_btts"],
-                    "top_scores": top,
-                    # no price existed for this match: a longer-range model estimate
-                    "long_range": r.get("model_kind") == "lgb_xg_price_free",
-                }
-            )
-        age = None
-        if last:
-            d = _parse(last)
-            age = None if d is None else (datetime.now(UTC) - d).total_seconds() / 3600
-        try:
-            warns = json.loads(meta.get("schedule_warnings") or "[]")
-        except ValueError:
-            warns = []
-        sched_stale = meta.get("schedule_stale") == "1"
-        return {
-            "rows": out,
-            "schedule": {
-                "fetched_utc": meta.get("schedule_fetched_utc") or None,
-                "stale": sched_stale,
-                "warnings": warns if sched_stale else [],
-            },
-            "last_updated_utc": last,
-            "age_hours": None if age is None else round(age, 1),
-            "stale_after_hours": PREDICTIONS_STALE_HOURS,
-            "stale": age is None or age > PREDICTIONS_STALE_HOURS,
-            "scope": "Premier League (E0) + La Liga (SP1) only",
-        }
+    telemetry.register(app, root)
 
     @app.get("/api/report/latest")
     def report():

@@ -4,7 +4,7 @@
 
 A football (soccer) match-prediction and **paper-betting** system built as a proper ML pipeline: calibrated statistical/ML models, blended with the betting market, judged by **closing-line value (CLV)** against the Betfair Exchange.
 
-> **Status:** research complete, implementation not started. See the plan.
+> **Status (2026-10):** pivoted to a **prediction-accuracy tracker** (Premier League + La Liga, winner and scoreline); betting is parked, see "Prediction-accuracy tracker" below.
 > **Mode:** paper only. Real money only after the gates in `docs/REPORT.md` §6 are passed and Rayan flips it manually.
 
 ## The idea in one paragraph
@@ -21,73 +21,133 @@ Python 3.13 (uv) · penaltyblog · LightGBM/CatBoost · scikit-learn · DuckDB +
 
 *Not financial advice. Gambling involves risk; BetStop (betstop.gov.au) is Australia's national self-exclusion register.*
 
-## Dashboard and scheduling
-Read-only local dashboard over `data/paper.sqlite` (opened `mode=ro`, bound to 127.0.0.1 only, no auth):
+## Prediction-accuracy tracker (current focus)
 
-    uv run python scripts/dashboard.py          # http://127.0.0.1:8765  (--port to change)
+**Strategy change:** betting is parked (unlikely to make money). football-edge now tracks how
+accurate its **predictions** are for the Premier League (`E0`) and La Liga (`SP1`): for every
+fixture it predicts the **winner (W/D/L) and the scoreline**, saves that prediction *before kick-off*
+(never edited), saves the real result afterwards, and shows accuracy over time. Bookmaker odds are
+not used by any prediction and are not shown anywhere (the old betting code, tests and the
+`bets` / `settlements` / `snapshots` tables are kept untouched as an archive; its Hermes cron jobs
+are **paused**, not deleted).
 
-Two pages. `/` is the upcoming-fixtures view (model probabilities, expected goals, predicted scoreline and goal markets only — no bookmaker prices). `/ledger` is the paper-trading book: mode/gate status, last picks/settle runs (STALE warning), open and settled bets, cumulative P&L/CLV, top snapshot edges and the latest weekly report. The fixtures page polls `/api/predictions`; the ledger pages poll `/api/summary`, `/api/open_bets`, `/api/settled`, `/api/series`, `/api/snapshots`. Both refresh every 60s.
+### Moving parts
 
-### Upcoming predictions panel (Premier League + La Liga only)
+| piece | what it does |
+|---|---|
+| `scripts/predict_upcoming.py` | refresh football-data + the full-season schedule, predict every upcoming E0/SP1 fixture with the current model, write the display cache and append to `prediction_log` |
+| `scripts/update_results.py` | fill `results` with finished matches (schedule scores, cross-checked against the football-data CSVs) |
+| `scripts/backfill_retro.py` | leakage-safe retrospective predictions for matches already played (`source='retro'`) |
+| `src/fedge/accuracy/` | `store.py` (tables + rules), `metrics.py`, `baselines.py`, `results.py`, `report.py` (the JSON behind the Accuracy tab) |
+| `src/fedge/predict/models.py` | the model registry (see below) |
+| `scripts/dashboard.py` | read-only dashboard: `/` Upcoming, `/accuracy`, `/archive` (old betting ledger; `/ledger` redirects) |
 
-`uv run python scripts/predict_upcoming.py` scores every upcoming **E0 / SP1** fixture and writes the
-`predictions` table of `data/paper.sqlite` (the script is the only writer; the dashboard stays
-`mode=ro`). The **main page** lists the upcoming E0/SP1 fixtures grouped by kick-off day
-(Australia/Sydney): per match the model's home/draw/away %, expected goals, the single most likely
-scoreline with its probability, over/under 2.5 and both-teams-to-score. It shows **no bookmaker
-prices at all** - the model may use them internally, but the page displays the model only. The bets,
-prices, edge, CLV and P&L live on a second page, `/ledger` (*Paper-trading ledger*), so the fixtures
-view stays clean. Both pages show a `last updated` age and a STALE flag after 20h.
+Hermes cron (all `no-agent`, output saved locally, failures go to Slack): `football-edge predictions`
+(`30 11,19 * * *` Sydney), `football-edge results` (`0 16 * * *`) and the hourly
+`football-edge catch-up (predict/results)` which re-runs either job if its last success is older
+than 12 h / 26 h (the PC is often off before ~11:00). The wrapper is `~/.hermes/scripts/fedge_paper.py`.
 
-The 1X2 **is** the live LightGBM model, which is itself **market-anchored** (its features include the
-de-margined snapshot price of the same match). The predicted scoreline is a **Dixon-Coles estimate**:
-expected goals per division come from `fedge.models.dixon_coles.fit_dc` (time-decayed, 5-year window,
-refit per run), and the score grid is reconciled to the LightGBM 1X2 by solving for the two goal rates
-whose grid reproduces the target home/away probabilities (`scipy.optimize.root`); if that does not
-converge - or to remove the last of the numerical error - the grid is rescaled by outcome class (IPF)
-so the 1X2 matches the model exactly. The predicted score and the goal markets are therefore a model
-estimate, not a market price. `/api/predictions` returns the model fields only (`probs`, `xg`,
-`top_scores`, `p_over25`, `p_btts`, `long_range`, plus a `schedule` block); the de-vigged price columns and the grid stay in the
-`predictions` table and are not served. Two ways to run it by hand:
+### The model (one price-free model for every fixture)
 
-    uv run python scripts/predict_upcoming.py --home Arsenal --away Chelsea   # single-match lookup
-    uv run python scripts/predict_upcoming.py --dry-run --json                # print, write nothing
+`fedge.predict.models` is a registry keyed by `model_version`; every prediction is produced by
+`models.predict(version, ...)` and stored with its version. Version `lgb_xg_dc_v1` is the
+non-anchored `lgb_xg` LightGBM 1X2 (ratings, form, xG form, schedule; **no market feature**)
+combined with a Dixon-Coles scoreline grid reconciled to that 1X2. Phase 2 (a model bake-off) will
+register alternatives with `@models.register("name")` and flip `CURRENT_VERSION`; nothing else
+changes. Fixtures weeks away are scored with today's ratings and will shift as results arrive.
 
-#### Whole-season schedule and the price-free model
+**Winner/score consistency:** the predicted score is the most likely score *within the predicted
+outcome class*, so score and winner always agree (a 1-1 grid mode inside a home-favourite match is
+reported as 1-0). The unconstrained grid mode is logged separately (`pred_mode_score_*`).
+
+### Telemetry: `data/predictions.sqlite`
+
+A **separate database** from the betting ledger (`data/paper.sqlite`): betting is parked, so the
+accuracy record must not depend on that file, can be backed up or rebuilt on its own, and the
+dashboard can open it `mode=ro` without touching the ledger. Tables:
+
+* `prediction_log` - **append-only** (SQLite triggers abort UPDATE/DELETE) and **frozen**: a row
+  with `run_ts >= kickoff_utc` is rejected (trigger + Python check). One row per
+  `(match_key, snapshot_kind, run_ts)`. Columns: match/league/teams/kickoff, `run_ts`,
+  `hours_before_kickoff`, `model_version`, `source` (`live`/`retro`), `p_home/p_draw/p_away`,
+  `xg_home/xg_away`, `pred_outcome`, `pred_score_home/away/p`, `pred_mode_score_home/away`,
+  `p_over25`, `p_btts`, `top_scores` (JSON, top 5), `grid` (JSON 8x8: 0-7 goals each side, rows = home).
+  No price column exists.
+* snapshot kinds: `run` = every logged prediction run (runs more than 14 days before kickoff are
+  shown on the page but not logged); **`d7`** = a copy of the *first* run at or after
+  `kickoff - 7 days`; **`d3`** = a copy of the *first* run at or after `kickoff - 3 days`. They are
+  unique per match and earn no back-fill: if no run fell inside a window (PC off, or the fixture only
+  became known later) that snapshot is simply absent. One run can carry both labels (two rows) -
+  `hours_before_kickoff` on every row says how early each one really was. **`final`** is derived,
+  not stored: view `v_final` = the latest `run` row before kickoff.
+* `results` - `match_key, div, home, away, kickoff_utc, home_goals, away_goals, result (H/D/A),
+  source, fetched_ts`. Inserted once per match (`INSERT OR IGNORE`); a re-fetch with a different
+  score is counted as a conflict and left alone.
+* `upcoming` + `meta` - replace-each-run display cache for the Upcoming page.
+
+Results: the full-season schedule feed **fixturedownload.com carries final scores**
+(`HomeTeamScore` / `AwayTeamScore`; openfootball carries `score.ft` as a fallback). The football-data
+season CSVs (`data/raw/football_data/2026-27/E0.csv`, `SP1.csv`) cross-check it (mismatches are
+printed) and fill gaps. Team names reuse `config/team_aliases.csv` + `config/schedule_aliases.csv`;
+unmapped names are logged to stderr. A rescheduled match gets a new `match_key` (the key includes
+the match date); the old key simply never gets a result.
+
+**Retrospective rows** (`scripts/backfill_retro.py`): matches already played get one prediction each
+from a model fitted only on matches kicked off *strictly before* their matchday group's first date
+(groups span at most 3 days; `run_ts` is that cut-off, so a Sunday match is predicted with Friday-
+morning knowledge). They are labelled *retrospective (not live)* on the page and excluded from the
+headline numbers unless you tick "Include retrospective predictions" (or `?include_retro=1` on
+`/api/accuracy`). They never get d7/d3 labels.
+
+### Reading the Accuracy tab (`/accuracy`, JSON at `/api/accuracy`)
+
+Headline = the `final` snapshot of each finished match. `n < 100` is flagged *small sample*;
+95% ranges are match-clustered bootstrap intervals (1000 resamples, seed 0).
+
+* **Winner hit rate** - the most likely outcome was right. **Brier** (multiclass, 0 best, a
+  33/33/33 guess scores 0.667), **log-loss** (1.099 for 33/33/33), **RPS** (ordered H<D<A) - lower is
+  better. **Calibration** - when the model says 30%, ~30% should happen. **Confusion matrix** and
+  the share of draws predicted vs actual (models rarely call a draw).
+* **Exact-score hit rate** - inherently hard: the single most likely score only has about a 10-12%
+  chance, so ~1 in 9 is the ceiling. Also top-3 / top-5 (actual score among the 3 / 5 most likely),
+  correct goal difference, MAE of expected goals vs goals scored, the mean probability and log
+  probability given to the real scoreline, and accuracy + Brier for Over 2.5 and both-teams-score.
+* **Baselines on the same matches:** always-home; league-average W/D/L frequencies (and the league's
+  most common scoreline); a naive Poisson from each team's previous-season goal rates. A useful model
+  must beat these.
+* **Splits:** per league, per month, and `d7` vs `d3` vs `final` (does accuracy improve closer to
+  kick-off? A like-for-like table restricts to matches that have all three).
+* The page also lists recent predictions vs results (winner / exact tick or cross), a calibration
+  chart and cumulative accuracy over time. The Upcoming page shows the real result next to our
+  prediction for matches that finished in the last 3 days.
+
+### Running it
+
+    uv run python scripts/predict_upcoming.py          # predict + log (about 2-3 min)
+    uv run python scripts/update_results.py            # fill results
+    uv run python scripts/backfill_retro.py [--max-groups N]   # once, for a populated Accuracy tab
+    uv run python scripts/dashboard.py                 # http://127.0.0.1:8765 (--port to change)
+    uv run python scripts/predict_upcoming.py --home Arsenal --away Chelsea   # one match
+
+### Archive (paper betting)
+
+The previous system (market-anchored `lgbd_xg`, paper bets, CLV, settlements, weekly report) is
+unchanged and still runnable (`scripts/paper_picks.py`, `paper_settle.py`, `paper_weekly.py`), but
+its cron jobs are paused and `config/strategy.toml` (gate 0 / mode) was not touched. Its ledger page
+is at `/archive` (low-key link in the footer of the Upcoming page); the old `/ledger` URL redirects
+there. The remainder of this README describes how the full-season schedule is built, which both the
+tracker and the archive use.
+
+#### Whole-season schedule
 
 football-data's `fixtures.csv` only carries the next few days (and often no E0/SP1 rows at all), so the
-panel lists **every remaining match of the season** from a full schedule (`src/fedge/ingest/schedule.py`):
+Upcoming page lists **every remaining match of the season** from a full schedule
+(`src/fedge/ingest/schedule.py`):
 
-1. **fixturedownload.com** JSON feed (primary; free, no key, UTC kickoffs),
+1. **fixturedownload.com** JSON feed (primary; free, no key, UTC kickoffs, final scores),
 2. **openfootball** `football.json` on GitHub (fallback; free, no key),
 3. the **last good cache** in `data/raw/schedule/` (flagged STALE on the page when both fail).
 
-No API key is needed. (football-data.org's free tier would work with `FOOTBALL_DATA_ORG_KEY`, 10 req/min, but is not required.)
-The schedule is re-fetched on every `predict_upcoming.py` / `paper_picks.py` run (`--no-refresh-schedule` /
-`--cached-fixtures` reuse the cache). Team names are mapped to the football-data names used by the rest of the repo
-via `config/team_aliases.csv` plus `config/schedule_aliases.csv`; an unmapped name is logged at ERROR level,
-printed to stderr and its fixtures are dropped (add the alias and re-run). football-data's `fixtures.csv` stays the
-source of bookmaker prices: a fixture that has a complete price replaces its schedule twin.
-
-Two 1X2 methods, stored per row in `predictions.model_kind`:
-
-* `lgbd_xg_priced` - fixtures with a price: the market-anchored `lgbd_xg` (unchanged).
-* `lgb_xg_price_free` - everything else (weeks away): the non-anchored `lgb_xg` (best price-free 1X2 model in
-  `reports/v2_main.md`, log loss 1.0103 vs Elo 1.0164, Dixon-Coles 1.0273), fed the ratings and form **as of today**
-  with no market feature. Rest-day features for a far-future match are computed as if it kicked off a week after the
-  division's latest played match. These rows carry a subtle *longer-range estimate* note on the page and **will shift
-  as results come in**. The scoreline is still the Dixon-Coles grid reconciled to that 1X2 (`predict_match`).
-
-The page has no date cut-off: league chips (all / Premier League / La Liga), a *Next 7 days / Whole season* toggle,
-fixtures grouped by day with 10 days shown at a time and a *Show more* button. This is display-only: shadow bets are
-still only placed for fixtures with real prices, and the picks digest on stdout is unchanged.
-
-The same refresh runs at the end of `scripts/paper_picks.py` (after the digest, stderr only, failures
-never fail the picks job). Fixtures in other divisions are not scored and not shown; the scoring
-scope is `desk_divisions` in `config/leagues.toml` (the paper desk and the panel share it, so a
-run bets and displays the same leagues).
-
-**Champions League is not supported**: football-data.co.uk publishes no CL results/fixtures/odds, so
-there is no training data, no fixture prices and no `predict_match` target for it.
-
-The home PC is often off before ~11:00, so the Hermes cron jobs are: picks `30 11,19 * * *`, settle `0 17 * * *`, weekly `0 12 * * 1`, plus an hourly `5 * * * *` catch-up job that runs picks/settle once if the last success (`data/last_run.json`, written by the wrapper `fedge_paper.py`) is older than 12h / 26h.
+Team names are mapped to the football-data names used by the rest of the repo via
+`config/team_aliases.csv` plus `config/schedule_aliases.csv`; an unmapped name is logged at ERROR level,
+printed to stderr and its fixtures are dropped (add the alias and re-run).

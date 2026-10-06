@@ -26,6 +26,7 @@ from scipy.optimize import root
 from fedge.models.dixon_coles import score_grid
 
 GRID_SHOW = 6  # scorelines 0..5 are returned as the display grid
+GRID_LOG = 8  # scorelines 0..7 are logged by the telemetry table
 MAX_GOALS = 12  # internal grid size (mass beyond is renormalised away, negligible)
 LAM_MIN, LAM_MAX = 0.05, 8.0
 
@@ -68,6 +69,35 @@ def _validate_target(target) -> np.ndarray:
     if abs(t.sum() - 1.0) > 1e-3:
         raise ValueError(f"target 1X2 must sum to 1, got {t.sum():.6f}")
     return t / t.sum()
+
+
+def outcome_class(i: int, j: int) -> str:
+    """``H`` / ``D`` / ``A`` for a (home goals, away goals) cell."""
+    return "H" if i > j else ("D" if i == j else "A")
+
+
+def consistent_score(grid: np.ndarray, p1x2) -> dict:
+    """Predicted outcome and the most likely score *within that outcome class*.
+
+    The predicted outcome is the argmax of ``p1x2`` (H, D, A; ties go to H then D). The predicted
+    score is the highest-probability cell of ``grid`` whose result is that outcome, so score and
+    winner always agree. ``mode_*`` is the unconstrained grid mode (it can disagree with the
+    outcome, e.g. a 1-1 mode inside a home-favourite match), kept only for analysis.
+    """
+    g = np.asarray(grid, dtype=float)
+    outcome = "HDA"[int(np.argmax(np.asarray(p1x2, dtype=float)))]
+    i, j = np.indices(g.shape)
+    cls = np.where(i > j, "H", np.where(i == j, "D", "A"))
+    masked = np.where(cls == outcome, g, -1.0)
+    ph, pa = np.unravel_index(int(np.argmax(masked)), g.shape)
+    mh, ma = np.unravel_index(int(np.argmax(g)), g.shape)
+    return {
+        "pred_outcome": outcome,
+        "pred_score_home": int(ph), "pred_score_away": int(pa),
+        "pred_score_p": float(g[ph, pa]),
+        "mode_score_home": int(mh), "mode_score_away": int(ma),
+        "mode_score_p": float(g[mh, ma]),
+    }
 
 
 def predict_match(
@@ -135,6 +165,9 @@ def predict_match(
         "top_scores": top,
         "grid": grid[:GRID_SHOW, :GRID_SHOW].tolist(),
         "grid_mass_shown": float(grid[:GRID_SHOW, :GRID_SHOW].sum()),
+        # 0-7 goals each side, for the telemetry log (mass beyond 7 is negligible)
+        "grid_log": grid[:GRID_LOG, :GRID_LOG].tolist(),
+        **consistent_score(grid[:GRID_LOG, :GRID_LOG], p1x2),
         "dc_p": [float(x) for x in dc_1x2],
         "lambda_home": lam_h,
         "lambda_away": lam_a,

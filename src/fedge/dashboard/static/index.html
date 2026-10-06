@@ -3,26 +3,28 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FEDGE // Upcoming fixtures</title>
+<title>Football predictions - Upcoming</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <div class="wrap">
 
   <div class="topbar">
-    <h1>FEDGE // Upcoming fixtures</h1>
-    <nav class="spacer"><a href="/ledger">Paper-trading ledger &rarr;</a></nav>
-    <span class="stamp" id="upd">loading&hellip;</span>
+    <h1>Football predictions</h1>
+    <nav class="tabs"><a href="/" class="on">Upcoming</a><a href="/accuracy">Accuracy</a></nav>
+    <span class="stamp spacer" id="upd">loading&hellip;</span>
   </div>
 
   <p class="intro">
     Every remaining Premier League and La Liga match this season, in kick-off order
-    (Australia/Sydney time). Probabilities, expected goals and the predicted score come from our
-    own model only &mdash; no bookmaker prices appear on this page. Matches more than a few days
-    away are marked <span class="lr">longer-range estimate</span>: they use today&rsquo;s team
-    ratings and will shift as results come in.
+    (Australia/Sydney time). For each match the model predicts the winner and the scoreline. The
+    predicted score is the most likely score <i>within</i> the predicted winner, so the two always
+    agree. Everything comes from our own model &mdash; no bookmaker prices are used or shown. Matches
+    further away will shift as results come in. How well past predictions did is on the
+    <a href="/accuracy">Accuracy</a> tab.
   </p>
 
+  <div id="recentRes"></div>
   <div class="controls" id="controls" hidden>
     <div class="chips" id="leagueChips"></div>
     <div class="chips" id="rangeChips"></div>
@@ -32,10 +34,11 @@
   <section id="preds"><div class="card"><div class="empty">loading&hellip;</div></div></section>
 
   <footer>
-    W/D/L are model probabilities. The predicted score is the single most likely scoreline from a
-    Dixon-Coles model estimate, and expected goals, Over 2.5 and both-teams-to-score come from the
-    same estimate. Model output only &mdash; not a price, not betting advice. The bets and P&amp;L
-    live on the <a href="/ledger">paper-trading ledger</a>.
+    W/D/L are model probabilities. The predicted score is the most likely scoreline within the
+    predicted winner (from a Dixon-Coles estimate reconciled to the 1X2); expected goals, Over 2.5
+    and both-teams-to-score come from the same estimate. Model output only &mdash; not a price, not
+    betting advice. <span class="mute">Old paper-betting work lives in the
+    <a href="/archive">archive</a>.</span>
   </footer>
 </div>
 
@@ -80,7 +83,7 @@ function matchCard(r) {
       </article>`;
   }
   const p = r.probs, xg = r.xg || {};
-  const top = (r.top_scores || [])[0];
+  const ps = r.pred_score || (r.top_scores || []).slice(0, 1).map(t => t.score.split("-"))[0];
   const bar = ["home","draw","away"].map(k =>
     `<i class="w-${k}" style="width:${(p[k]*100).toFixed(2)}%"></i>`).join("");
   const leg = [["home", r.home, p.home], ["draw", "Draw", p.draw], ["away", r.away, p.away]]
@@ -88,17 +91,32 @@ function matchCard(r) {
       `<div><span class="dot ${k}"></span><span class="label">${esc(label)}</span> <b>${pct(v)}</b></div>`)
     .join("");
   const facts = [
-    top ? `<span class="fact score">Predicted score <span class="pill">${esc(top.score)}</span> <span class="mute">${pct(top.p)} chance</span></span>` : "",
+    ps ? `<span class="fact score">Predicted score <span class="pill">${esc(ps[0])}&ndash;${esc(ps[1])}</span> <span class="mute">${r.pred_score_p != null ? pct(r.pred_score_p) + " chance" : ""}</span></span>` : "",
     (xg.home != null) ? `<span class="fact">Expected goals <b>${num(xg.home)}</b> &ndash; <b>${num(xg.away)}</b></span>` : "",
     (r.p_over25 != null) ? `<span class="fact">Over 2.5 goals <b>${pct(r.p_over25)}</b></span>` : "",
     (r.p_btts != null) ? `<span class="fact">Both teams score <b>${pct(r.p_btts)}</b></span>` : "",
   ].filter(Boolean).join("");
-  const lr = r.long_range ? `<div class="lr-note">longer-range estimate</div>` : "";
   return `<article class="match">${head}
     <div class="wdl-bar">${bar}</div>
     <div class="wdl-legend">${leg}</div>
     <div class="facts">${facts}</div>
-    ${lr}
+  </article>`;
+}
+
+/* Matches finished in the last few days: our prediction next to what actually happened. */
+function finishedCard(r) {
+  const p = r.probs, W = {H: "home win", D: "draw", A: "away win"};
+  return `<article class="match">
+    <div class="head">
+      <span class="chip">${esc(LEAGUE[r.div] || r.league)}</span>
+      <span class="teams">${esc(r.home)} <span class="vs">v</span> ${esc(r.away)}</span>
+      <span class="ko">${koSydney(r.kickoff_local || r.kickoff_utc)}</span>
+    </div>
+    <div class="facts" style="margin-top:0;padding-top:0;border-top:0">
+      <span class="fact">Predicted <span class="pill">${r.pred_score[0]}&ndash;${r.pred_score[1]}</span> ${W[r.pred_outcome]} <span class="mute">(${pct(p.home,0)} / ${pct(p.draw,0)} / ${pct(p.away,0)})</span></span>
+      <span class="fact">Result <span class="pill">${r.actual_score[0]}&ndash;${r.actual_score[1]}</span> ${W[r.actual]}</span>
+      <span class="fact">Winner ${r.winner_ok ? '<span class="good">&#10003;</span>' : '<span class="bad">&#10007;</span>'} &nbsp; Exact score ${r.exact_ok ? '<span class="good">&#10003;</span>' : '<span class="bad">&#10007;</span>'}${r.source === "retro" ? ' <span class="retro" title="made after the match, not live">retro</span>' : ""}</span>
+    </div>
   </article>`;
 }
 
@@ -130,11 +148,15 @@ function render(p) {
     ? `<div class="notice">The fixture list could not be refreshed, so this is the last good copy${sch.fetched_utc ? " from " + ts(sch.fetched_utc) : ""}. Dates may have moved.</div>`
     : "";
   $("controls").hidden = !rows.length;
+  const rr = p.recent_results || [];
+  $("recentRes").innerHTML = rr.length
+    ? `<div class="day"><div class="day-head"><b>Finished in the last ${p.recent_days || 3} days</b><span>our prediction vs the real result</span></div>${rr.map(finishedCard).join("")}</div>`
+    : "";
   if (!rows.length) {
     $("preds").innerHTML = `<div class="card"><div class="empty">
-      No upcoming ${esc(p.scope)} fixtures have been scored yet.<br><br>
-      Scores are written by <b>scripts/predict_upcoming.py</b>, which also runs at the end of every
-      paper-picks job, so this page fills in on the next run.</div></div>`;
+      No upcoming ${esc(p.scope)} fixtures have been predicted yet.<br><br>
+      Predictions are written by <b>scripts/predict_upcoming.py</b> (scheduled twice a day), so this
+      page fills in on the next run.</div></div>`;
     return;
   }
   const count = d => rows.filter(r => d === "all" || r.div === d).length;
