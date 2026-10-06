@@ -371,6 +371,20 @@ def _fmt(v) -> str:
     return str(v)
 
 
+def _fmt_slopes(df: pd.DataFrame) -> pd.DataFrame:
+    """Copy of ``df`` with every ``cal_slope`` column rendered through ``M.fmt_slope``.
+
+    ``md_table`` formats floats itself; pre-transforming to strings routes separated
+    (non-estimable) calibration fits through the ``n.e.`` flag without touching any maths
+    or the CSV companions.
+    """
+    df = df.copy()
+    for c in df.columns:
+        if c == "cal_slope" or c.endswith("_cal_slope"):
+            df[c] = df[c].map(M.fmt_slope)
+    return df
+
+
 def md_table(df: pd.DataFrame, cols: list[str], headers: list[str] | None = None) -> str:
     head = headers or cols
     lines = ["| " + " | ".join(head) + " |", "|" + "|".join("---" for _ in head) + "|"]
@@ -400,6 +414,7 @@ def per_league_season_table(scores: pd.DataFrame, market: str, refs: pd.DataFram
             c = f"{model}_{metric}"
             if c in piv.columns:
                 cols.append(c)
+    piv = _fmt_slopes(piv)
     return md_table(piv.sort_values(["div", "season"]), cols)
 
 
@@ -419,21 +434,55 @@ def interpretation(pools: pd.DataFrame) -> str:
             "timing / execution (v3) over more model work."
         )
     else:
-        for r in sig.sort_values("w_pooled", ascending=False).itertuples(index=False):
+        out.append(
+            f"{len(sig)} of {len(pre)} pre-closing (division x market) cells have a 95% "
+            "bootstrap CI excluding 0. The CI belongs to `w_pooled`, which is an **in-sample** "
+            "weight: it is refit on the whole sample, so the CI measures how tightly a weight "
+            "chosen with hindsight is pinned down, not whether that weight would have helped "
+            "out of sample. The out-of-sample statistic is `w_expanding` (fitted on strictly "
+            "earlier test seasons only), and it is the weight the pooled log-losses below are "
+            "scored with. Cells are listed below in `w_expanding` order. Multiple testing: "
+            f"{len(pre)} pre-closing cells are searched for a significant CI "
+            f"({len(pools)} cells across both phases), so roughly {0.05 * len(pre):.1f} "
+            "significant pre-closing cells are expected by chance alone at 5%."
+        )
+        for r in sig.sort_values("w_expanding", ascending=False).itertuples(index=False):
             out.append(
-                f"- {r.div} {r.market} ({r.phase}): w_expanding={r.w_expanding:.3f}, "
-                f"w_pooled={r.w_pooled:.3f} [{r.w_lo:.3f}, {r.w_hi:.3f}] "
-                f"(n={r.n}; pooled log-loss {r.pool_logloss:.4f} vs market "
+                f"- {r.div} {r.market} ({r.phase}): w_expanding={r.w_expanding:.3f} "
+                f"(out-of-sample); w_pooled={r.w_pooled:.3f} [{r.w_lo:.3f}, {r.w_hi:.3f}] "
+                f"(in-sample CI; n={r.n}; pooled log-loss {r.pool_logloss:.4f} vs market "
                 f"{r.market_logloss:.4f})"
             )
+        worse = sig[sig["pool_logloss"] > sig["market_logloss"]]
+        better = sig[~(sig["pool_logloss"] > sig["market_logloss"])]
+        out += [
+            "",
+            f"**Out-of-sample test of those {len(sig)} cells (expanding weight).** "
+            f"{len(worse)} of {len(sig)} have a pooled log-loss *worse* than the market on the "
+            "same matches:",
+        ]
+        for r in worse.sort_values("w_expanding", ascending=False).itertuples(index=False):
+            out.append(
+                f"  - {r.div} {r.market} ({r.phase}): pooled {r.pool_logloss:.4f} vs market "
+                f"{r.market_logloss:.4f} (w_expanding={r.w_expanding:.3f})"
+            )
+        if worse.empty:
+            out.append("  - (none)")
+        out.append(
+            f"So only {len(better)} of the {len(sig)} CI-significant pre-closing cells also "
+            "improve on the market **out of sample**; the rest are artefacts of the in-sample "
+            "weight and of searching many cells."
+        )
     close = pools[(pools["phase"] == "close")]
     close_sig = close[close["w_lo"] > CI_ZERO_TOL]
     out += [
         "",
-        f"Against the **closing** price, {len(close_sig)} of {len(close)} cells have a CI "
-        "excluding 0 (the closing price is the hardest benchmark; the literature expects ~0).",
+        f"Against the **closing** price, {len(close_sig)} of {len(close)} cells have an "
+        "(in-sample) CI excluding 0 (the closing price is the hardest benchmark; the "
+        "literature expects ~0).",
         "",
-        "Pre-closing cells sorted by mean expanding-window weight:",
+        "Pre-closing cells sorted by mean expanding-window weight "
+        "(`w_pooled`/`w_lo`/`w_hi` are in-sample):",
         "",
     ]
     top = pre.sort_values("w_expanding", ascending=False).head(10)
@@ -550,6 +599,8 @@ def write_report(datasets, scores, pools, details, refs) -> None:  # pragma: no 
         json.loads(RATINGS_INFO.read_text(encoding="utf-8")) if RATINGS_INFO.exists() else {}
     )
     d1, d25 = datasets["1x2"], datasets["ou25"]
+    s1 = sorted(d1["season"].unique())
+    s25 = sorted(d25["season"].unique())
     books = refs.groupby(["market", "phase", "book"], observed=True).size().reset_index()
     books.columns = ["market", "phase", "book", "n_cells"]
     lines = [
@@ -562,10 +613,15 @@ def write_report(datasets, scores, pools, details, refs) -> None:  # pragma: no 
         "",
         "## 1. What was run",
         "",
-        f"- Divisions: {d1['div'].nunique()}; test seasons 2016/17 onward "
-        f"({d1['season'].nunique()} seasons, the last one partial).",
-        f"- Matches with all of DC + Elo + pi + a reference market: {len(d1)} (1X2), "
-        f"{len(d25)} (over/under 2.5).",
+        f"- Divisions: {d1['div'].nunique()}.",
+        f"- **1X2 evaluation window**: {s1[0]} to {s1[-1]} ({len(s1)} seasons, the last one "
+        f"partial); {len(d1)} matches with all of DC + Elo + pi + a reference market.",
+        f"- **Over/under 2.5 evaluation window**: {s25[0]} to {s25[-1]} ({len(s25)} seasons, "
+        f"the last one partial); {len(d25)} matches. This is **not** the same window as 1X2: "
+        "the pre-2019/20 ou25 cells have no closing reference book - `reference_books` "
+        "returns `book = 'none'` for ou25/close before 2019/20 (126 cells in "
+        "`v1_baseline_reference_books.csv`) - so `build_dataset` drops those rows, and every "
+        "over/under 2.5 number in this report is 2019/20 onward.",
         "- **Dixon-Coles** (penaltyblog): per-division team parameters on a 5-year rolling "
         "window with exponential time decay `exp(-xi * years)`; refit **every matchweek**; xi "
         "re-selected in-fold once per (division, test season) from "
@@ -596,19 +652,23 @@ def write_report(datasets, scores, pools, details, refs) -> None:  # pragma: no 
         "",
         md_table(books, ["market", "phase", "book", "n_cells"]),
         "",
-        "## 2. Pooled scores (all divisions, test seasons 2016/17 onward)",
+        "## 2. Pooled scores (all divisions; 1X2 test seasons 2016/17 onward, over/under 2.5 "
+        "2019/20 onward)",
         "",
         "RPS and Brier are multiclass sums (lower is better); `cal_slope` is the pooled "
-        "one-vs-rest logistic recalibration slope (1.0 = calibrated).",
+        "one-vs-rest logistic recalibration slope (1.0 = calibrated). `n.e.` = not estimable: "
+        "the one-vs-rest logistic recalibration separated at this sample size (|slope| > 10), "
+        "so the number is an artefact, not a calibration measurement.",
         "",
         "### 1X2",
         "",
-        md_table(pooled_scores(d1, "1x2"), ["model", "n", "rps", "log_loss", "brier", "cal_slope"]),
+        md_table(_fmt_slopes(pooled_scores(d1, "1x2")),
+                 ["model", "n", "rps", "log_loss", "brier", "cal_slope"]),
         "",
-        "### Over/under 2.5",
+        "### Over/under 2.5 (test seasons 2019/20 onward)",
         "",
         md_table(
-            pooled_scores(d25, "ou25"),
+            _fmt_slopes(pooled_scores(d25, "ou25")),
             ["model", "n", "rps", "log_loss", "brier", "cal_slope"],
         ),
         "",
@@ -634,6 +694,12 @@ def write_report(datasets, scores, pools, details, refs) -> None:  # pragma: no 
         ),
         "",
         "Per-season weights: `v1_baseline_pool_weights_by_season.csv`.",
+        "",
+        "`w_expanding` is the **out-of-sample** statistic (the weight is fitted only on "
+        "strictly earlier test seasons); `w_pooled`, `w_lo` and `w_hi` are **in-sample** (the "
+        "weight is refit on the whole sample, so the CI is a within-sample diagnostic, not "
+        "out-of-sample evidence). 1X2 cells cover test seasons 2016/17 onward and over/under "
+        "2.5 cells 2019/20 onward (section 1).",
         "",
         "## 5. Interpretation",
         "",

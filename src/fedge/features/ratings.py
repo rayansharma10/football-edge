@@ -106,7 +106,7 @@ def elo_sweep(
     ratings: dict[str, float] = {}
     ptr = 0
     for i in range(len(matches)):
-        while ptr < i and ko[ptr] <= cut[i]:
+        while ptr < i and ko[ptr] < cut[i]:
             h, a = home[ptr], away[ptr]
             rh = ratings.get(h, start)
             ra = ratings.get(a, start)
@@ -142,7 +142,7 @@ def pi_sweep(
     sys = PiRatingSystem(alpha=alpha, beta=beta, k=k, sigma=sigma)
     ptr = 0
     for i in range(len(matches)):
-        while ptr < i and ko[ptr] <= cut[i]:
+        while ptr < i and ko[ptr] < cut[i]:
             sys.update_ratings(home[ptr], away[ptr], gh[ptr] - ga[ptr])
             ptr += 1
         out[i] = sys.expected_goal_difference(home[i], away[i])

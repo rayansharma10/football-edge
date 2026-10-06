@@ -12,6 +12,31 @@ import pandas as pd
 
 _EPS = 1e-15
 
+# A logistic recalibration whose |slope| exceeds this is "separated": a handful of near-0/1
+# forecasts fit by an unbounded Newton step, so the value is an artefact of the sample size, not
+# a calibration measurement. Reports render such values through ``fmt_slope``.
+SLOPE_NOT_ESTIMABLE = 10.0
+
+
+def slope_not_estimable(b) -> bool:
+    """True when a calibration slope is a separated fit rather than a measurable slope."""
+    if b is None:
+        return True
+    b = float(b)
+    return not np.isfinite(b) or abs(b) > SLOPE_NOT_ESTIMABLE
+
+
+def fmt_slope(b, nd: int = 4) -> str:
+    """Format a calibration slope, flagging separated (non-estimable) fits as ``n.e.``."""
+    if b is None:
+        return "-"
+    b = float(b)
+    if not np.isfinite(b):
+        return "-"
+    if slope_not_estimable(b):
+        return "n.e."
+    return f"{b:.{nd}f}"
+
 
 def _prep(probs, y) -> tuple[np.ndarray, np.ndarray]:
     p = np.asarray(probs, dtype=float)

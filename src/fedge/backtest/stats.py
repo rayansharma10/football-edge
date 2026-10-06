@@ -3,8 +3,15 @@
 CLV definition: log(price_taken * p_close_fair) = log(price_taken / fair_close_odds), where
 p_close_fair is the margin-free closing probability of the selection (see fedge.market). Taking
 exactly the fair closing price gives CLV = 0. The raw margined closing price is worse than fair:
-CLV = -log(booksum) < 0, the cost of the margin.
+CLV < 0: the cost of the margin. That cost is not a fixed identity - -log(booksum) holds for
+multiplicative de-vig, but under the power method used here (``fedge.market.devig``) the
+per-selection margin varies with the price (the P2 review measured deviations up to 0.398).
 For exchange prices pass commission-adjusted odds (see ``net_odds``).
+
+Risk limits: ``config/limits.toml`` also sets ``max_bets_per_day``. It is not applied here (the
+simulator has no edge column to rank a day's bets by) and it is not binding on the historical
+ledger (at most 10 above-threshold bets fall on one day in the committed Gate 0 run); Phase 6's
+live desk enforces it.
 """
 
 from __future__ import annotations

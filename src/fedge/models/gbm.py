@@ -162,6 +162,83 @@ def predict_model(model, learner: str, task: str, X: pd.DataFrame, init=None) ->
     return _to_probs(np.asarray(raw, dtype=float), init, task)
 
 
+def fit_live(
+    table: pd.DataFrame,
+    feature_cols: list[str],
+    y_col: str,
+    task: str,
+    learner: str,
+    asof,
+    init_cols: list[str] | None = None,
+    threads: int = 4,
+    embargo: pd.Timedelta = EMBARGO,
+    log=None,
+) -> tuple[object, object, dict]:
+    """The "next fold" of :func:`walk_forward`, for fixtures that have not been played yet.
+
+    ``asof`` is the bet/fixture time (tz-aware UTC). The protocol is exactly the walk-forward one
+    with the test season replaced by everything at/after ``asof``:
+
+    1. ``S1`` = the last season present in ``table``. Model A trains on rows before ``S1``,
+       early-stopping on the chronological first half of ``S1``.
+    2. The calibrator is chosen on model A's probabilities for the second half of ``S1``.
+    3. The final model is refit on every row with ``kickoff < asof - embargo`` with
+       ``round(best_iter * 1.1)`` trees, and the chosen calibrator is returned with it.
+
+    Returns ``(model, calibrator, info)``; ``info`` holds ``best_iter``, ``rounds``, ``calibrator``,
+    ``n_train``, ``n_cal`` and the calibrator scores. Nothing here reads a row at/after the embargo
+    cut, so the fixtures' own results can never enter their features or their fit.
+    """
+    d = table.sort_values("kickoff_utc", kind="mergesort")
+    if init_cols is not None:
+        d = d.loc[d[init_cols].notna().all(axis=1)]
+    seasons = sorted(d["season"].astype(str).unique(), key=_season_key)
+    if len(seasons) < 2:
+        raise ValueError(f"need at least two seasons to fit live; got {seasons}")
+    ko = d["kickoff_utc"]
+    sea = d["season"].astype(str)
+    y_all = d[y_col].to_numpy(dtype=int)
+    X_all = d[feature_cols]
+    init_all = to_scores(d[init_cols].to_numpy(dtype=float), task) if init_cols else None
+    s1 = seasons[-1]
+    s1_rows = np.flatnonzero((sea == s1).to_numpy())
+    if len(s1_rows) < 2:
+        raise ValueError(f"last season {s1} has {len(s1_rows)} rows: cannot calibrate on it")
+    half = len(s1_rows) // 2
+    es_rows, cal_rows = s1_rows[:half], s1_rows[half:]
+    s1_start = ko.iloc[s1_rows].min()
+    asof_ts = pd.Timestamp(asof)
+    asof_ts = asof_ts.tz_localize("UTC") if asof_ts.tzinfo is None else asof_ts
+    tr_a = np.flatnonzero((ko < s1_start - embargo).to_numpy())
+    tr_f = np.flatnonzero((ko < asof_ts - embargo).to_numpy())
+
+    def sl(idx):
+        return (X_all.iloc[idx], y_all[idx], None if init_all is None else init_all[idx])
+
+    Xa, ya, ia = sl(tr_a)
+    Xe, ye, ie = sl(es_rows)
+    model_a, best = fit_model(learner, task, Xa, ya, Xe, ye, ia, ie, threads=threads)
+    Xc, yc, ic = sl(cal_rows)
+    p_cal = predict_model(model_a, learner, task, Xc, ic)
+    name, cal, scores = calibrate.select_calibrator(p_cal, yc)
+    Xf, yf, if_ = sl(tr_f)
+    rounds = max(int(round(best * 1.1)), 1)
+    model_f, _ = fit_model(learner, task, Xf, yf, None, None, if_, None, rounds=rounds,
+                           threads=threads)
+    info = {
+        "best_iter": int(best),
+        "rounds": int(rounds),
+        "calibrator": name,
+        "n_train": int(len(tr_f)),
+        "n_cal": int(len(cal_rows)),
+        "asof": str(asof_ts),
+        **{f"ll_{k}": v for k, v in scores.items()},
+    }
+    if log:
+        log(f"  live {learner}/{task}: iter={best} cal={name} n_train={len(tr_f)}")
+    return model_f, cal, info
+
+
 def _season_key(s: str) -> int:
     return int(str(s)[:4])
 
