@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FEDGE // PAPER DESK</title>
+<style>
+  /* 5-colour palette, hard edges, no glow, no gradients, 2px dither. */
+  :root{ --bg:#1b0f1e; --panel:#271629; --ink:#e9dcb5; --mute:#8d7b8f; --acc:#ffb000; --good:#7ee081; --bad:#ff4d6d;
+         --mono:"Courier New", ui-monospace, Consolas, monospace; }
+  *{ box-sizing:border-box; margin:0; padding:0; border-radius:0; }
+  body{ background-color:var(--bg);
+        background-image:linear-gradient(45deg,#231527 25%,transparent 25%,transparent 75%,#231527 75%),
+                         linear-gradient(45deg,#231527 25%,transparent 25%,transparent 75%,#231527 75%);
+        background-size:4px 4px; background-position:0 0,2px 2px;
+        color:var(--ink); font:14px/1.45 var(--mono); letter-spacing:.04em; -webkit-font-smoothing:none; padding:16px; }
+  h1{ font-size:20px; text-transform:uppercase; color:var(--acc); display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px; }
+  h1 small{ color:var(--mute); font-size:12px; }
+  h2{ font-size:13px; text-transform:uppercase; color:var(--acc); margin-bottom:8px; }
+  .grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:16px; margin-top:16px; }
+  .wide{ grid-column:1/-1; }
+  .box{ background:var(--panel); border:3px solid var(--ink); box-shadow:6px 6px 0 #000; padding:12px; overflow-x:auto; }
+  .kv{ display:grid; grid-template-columns:auto 1fr; gap:2px 14px; }
+  .kv span:nth-child(odd){ color:var(--mute); }
+  .tag{ display:inline-block; padding:0 6px; border:2px solid currentColor; text-transform:uppercase; }
+  .good{ color:var(--good); } .bad{ color:var(--bad); } .mute{ color:var(--mute); } .acc{ color:var(--acc); }
+  .stale{ background:var(--bad); color:#1b0f1e; padding:0 6px; font-weight:bold; }
+  table{ border-collapse:collapse; width:100%; font-size:12px; }
+  th{ text-align:left; color:var(--mute); text-transform:uppercase; border-bottom:2px solid var(--mute); padding:2px 8px 2px 0; white-space:nowrap; }
+  td{ padding:2px 8px 2px 0; white-space:nowrap; border-bottom:2px dotted #3d2a40; }
+  td.n, th.n{ text-align:right; }
+  canvas{ width:100%; height:200px; image-rendering:pixelated; display:block; background:#140a16; border:2px solid var(--mute); }
+  a{ color:var(--acc); }
+  .empty{ color:var(--mute); padding:6px 0; }
+  .legend span{ margin-right:14px; }
+</style>
+</head>
+<body>
+<h1><span>&#9608; FEDGE // PAPER DESK</span><small id="upd">loading&hellip;</small></h1>
+
+<div class="grid">
+  <div class="box"><h2>Mode / gate</h2><div class="kv" id="mode"></div></div>
+  <div class="box"><h2>Jobs</h2><div class="kv" id="jobs"></div></div>
+  <div class="box"><h2>Ledger</h2><div class="kv" id="counts"></div></div>
+
+  <div class="box wide">
+    <h2>Cumulative P&amp;L (units) / mean log-CLV</h2>
+    <canvas id="chart" width="240" height="72"></canvas>
+    <div class="legend mute" style="margin-top:6px"><span class="acc">&#9632; cum P&amp;L</span><span class="good">&#9632; mean log-CLV (x scaled)</span><span id="chartnote"></span></div>
+  </div>
+
+  <div class="box wide"><h2>Open bets</h2><div id="open"></div></div>
+  <div class="box wide"><h2>Settled bets</h2><div id="settled"></div></div>
+  <div class="box wide"><h2>Latest snapshot &mdash; top edges</h2><div id="snaps"></div></div>
+  <div class="box wide"><h2>Weekly report</h2><div id="report"></div></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const num = (v, d=2) => v == null ? "-" : Number(v).toFixed(d);
+const pct = (v, d=1) => v == null ? "-" : (v*100).toFixed(d) + "%";
+const sign = v => v == null ? "" : (v > 0 ? "good" : v < 0 ? "bad" : "");
+const kv = rows => rows.map(([k,v]) => `<span>${esc(k)}</span><span>${v}</span>`).join("");
+const ts = t => t ? esc(t.replace("T"," ").slice(0,16)) : "-";
+
+function table(cols, rows, emptyMsg) {
+  if (!rows.length) return `<div class="empty">${esc(emptyMsg)}</div>`;
+  const h = cols.map(c => `<th class="${c.n?"n":""}">${esc(c.h)}</th>`).join("");
+  const b = rows.map(r => "<tr>" + cols.map(c => {
+    const v = c.f(r); return `<td class="${c.n?"n":""} ${c.cls?c.cls(r):""}">${v}</td>`; }).join("") + "</tr>").join("");
+  return `<table><tr>${h}</tr>${b}</table>`;
+}
+
+async function j(url) { const r = await fetch(url, {cache:"no-store"}); if (!r.ok) throw new Error(url + " " + r.status); return r.json(); }
+
+function drawChart(points) {
+  const cv = $("chart"), g = cv.getContext("2d"); g.imageSmoothingEnabled = false;
+  const W = cv.width, H = cv.height; g.fillStyle = "#140a16"; g.fillRect(0,0,W,H);
+  if (points.length < 1) { $("chartnote").textContent = "no settled bets yet"; return; }
+  $("chartnote").textContent = points.length + " settled";
+  const pnl = points.map(p => p.cum_pnl), clv = points.map(p => p.mean_clv);
+  const cvScaled = clv.map(v => v == null ? null : v * 100);   // log-CLV x100 so it shares an axis
+  const all = pnl.concat(cvScaled.filter(v => v != null), [0]);
+  const lo = Math.min(...all), hi = Math.max(...all), span = (hi - lo) || 1;
+  const y = v => Math.round(H - 4 - (v - lo) / span * (H - 8));
+  const x = i => points.length === 1 ? W/2|0 : Math.round(4 + i * (W - 8) / (points.length - 1));
+  g.fillStyle = "#3d2a40";
+  for (let px = 0; px < W; px += 2) g.fillRect(px, y(0), 1, 1);    // dotted zero line
+  const line = (arr, col) => { g.fillStyle = col; let prev = null;
+    arr.forEach((v, i) => { if (v == null) return; const cx = x(i), cy = y(v);
+      if (prev) { const n = Math.max(Math.abs(cx-prev[0]), Math.abs(cy-prev[1]), 1);
+        for (let s = 0; s <= n; s++) g.fillRect(Math.round(prev[0] + (cx-prev[0])*s/n), Math.round(prev[1] + (cy-prev[1])*s/n), 1, 1); }
+      g.fillRect(cx-1, cy-1, 3, 3); prev = [cx, cy]; }); };
+  line(cvScaled, "#7ee081"); line(pnl, "#ffb000");
+}
+
+async function refresh() {
+  try {
+    const [s, ob, st, se, sn] = await Promise.all([j("/api/summary"), j("/api/open_bets"), j("/api/settled"), j("/api/series"), j("/api/snapshots")]);
+    $("upd").textContent = "updated " + new Date().toLocaleTimeString() + " \u00b7 refresh 60s";
+    const gate = s.gate0_passed ? `<span class="tag good">PASSED</span>` : `<span class="tag bad">NOT PASSED</span>`;
+    $("mode").innerHTML = kv([
+      ["mode", `<span class="tag acc">${esc(s.mode ?? "?")}</span>`],
+      ["gate0", gate],
+      ["shadow edge bar", pct(s.shadow_threshold)],
+      ...Object.entries(s.markets).map(([k, m]) => ["market " + k, `${esc(m.model)} ${m.qualified ? '<span class="good">qualified</span>' : '<span class="mute">not qualified</span>'}`]),
+    ]);
+    $("jobs").innerHTML = kv(Object.entries(s.jobs).flatMap(([name, jb]) => [
+      [name + " last ok", `${jb.last_success_utc ? ts(jb.last_success_utc) + " UTC" : "never"} ${jb.age_hours != null ? `<span class="mute">(${jb.age_hours}h ago)</span>` : ""} ${jb.stale ? '<span class="stale">STALE</span>' : '<span class="good">ok</span>'}`],
+      [name + " last try", ts(jb.last_attempt_utc)],
+    ]));
+    $("counts").innerHTML = kv([
+      ["bets", s.counts.bets], ["open", s.counts.open], ["settled", s.counts.settled], ["snapshots", s.counts.snapshots],
+      ["P&L (units)", `<span class="${sign(s.settled.pnl_units)}">${num(s.settled.pnl_units, 3)}</span>`],
+      ["mean log-CLV", `<span class="${sign(s.settled.mean_log_clv)}">${num(s.settled.mean_log_clv, 4)}</span>`],
+      ["ledger", s.ledger_exists ? "present" : '<span class="bad">missing</span>'],
+    ]);
+
+    drawChart(se.points);
+
+    const bet = r => `${esc(r.home)} v ${esc(r.away)}`;
+    $("open").innerHTML = table([
+      {h:"kickoff UTC", f:r => ts(r.kickoff_utc)}, {h:"div", f:r => esc(r.div)}, {h:"match", f:bet},
+      {h:"mkt", f:r => esc(r.market)}, {h:"sel", f:r => esc(r.selection)},
+      {h:"price", n:1, f:r => num(r.price_taken)}, {h:"edge", n:1, f:r => pct(r.edge)}, {h:"stake", n:1, f:r => num(r.stake_units, 3)}, {h:"mode", f:r => esc(r.mode)},
+    ], ob.rows, "no open bets (ledger empty or nothing cleared the edge bar)");
+    $("settled").innerHTML = table([
+      {h:"settled UTC", f:r => ts(r.settled_utc)}, {h:"div", f:r => esc(r.div)}, {h:"match", f:bet},
+      {h:"mkt", f:r => esc(r.market)}, {h:"sel", f:r => esc(r.selection)}, {h:"result", f:r => esc(r.result)},
+      {h:"price", n:1, f:r => num(r.price_taken)}, {h:"close", n:1, f:r => num(r.closing_price)},
+      {h:"pnl", n:1, f:r => num(r.pnl, 3), cls:r => sign(r.pnl)}, {h:"log-clv", n:1, f:r => num(r.log_clv, 4), cls:r => sign(r.log_clv)},
+    ], st.rows, "nothing settled yet");
+    $("snaps").innerHTML = table([
+      {h:"kickoff UTC", f:r => ts(r.kickoff_utc)}, {h:"div", f:r => esc(r.div)}, {h:"match", f:bet},
+      {h:"mkt", f:r => esc(r.market)}, {h:"sel", f:r => esc(r.selection)}, {h:"price", n:1, f:r => num(r.price)},
+      {h:"model", n:1, f:r => pct(r.model_prob)}, {h:"pooled", n:1, f:r => pct(r.pooled_prob)},
+      {h:"edge", n:1, f:r => pct(r.edge), cls:r => sign(r.edge)},
+    ], sn.rows, "no snapshots yet");
+    $("report").innerHTML = s.latest_report
+      ? `<a href="/api/report/latest" target="_blank">${esc(s.latest_report)}</a> <span class="mute">(plain-text markdown)</span>`
+      : `<span class="empty">no weekly report yet</span>`;
+  } catch (e) {
+    $("upd").innerHTML = `<span class="stale">ERROR</span> ${esc(e.message)}`;
+  }
+}
+refresh(); setInterval(refresh, 60000);
+</script>
+</body>
+</html>

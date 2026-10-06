@@ -20,3 +20,12 @@ Good models rarely out-predict the *closing* odds, but markets are less efficien
 Python 3.13 (uv) · penaltyblog · LightGBM/CatBoost · scikit-learn · DuckDB + Parquet · pandera · betfairlightweight/flumine · Hermes cron + Slack for ops.
 
 *Not financial advice. Gambling involves risk; BetStop (betstop.gov.au) is Australia's national self-exclusion register.*
+
+## Dashboard and scheduling
+Read-only local dashboard over `data/paper.sqlite` (opened `mode=ro`, bound to 127.0.0.1 only, no auth):
+
+    uv run python scripts/dashboard.py          # http://127.0.0.1:8765  (--port to change)
+
+Shows mode/gate status, last picks/settle runs (STALE warning), open and settled bets, cumulative P&L/CLV, top snapshot edges and the latest weekly report; it polls `/api/summary`, `/api/open_bets`, `/api/settled`, `/api/series`, `/api/snapshots` every 60s.
+
+The home PC is often off before ~11:00, so the Hermes cron jobs are: picks `30 11,19 * * *`, settle `0 17 * * *`, weekly `0 12 * * 1`, plus an hourly `5 * * * *` catch-up job that runs picks/settle once if the last success (`data/last_run.json`, written by the wrapper `fedge_paper.py`) is older than 12h / 26h.
