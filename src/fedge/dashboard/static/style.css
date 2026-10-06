@@ -103,7 +103,7 @@ th{
   border-bottom:1px solid var(--line); padding:4px 12px 8px 0; white-space:nowrap;
 }
 td{ padding:8px 12px 8px 0; border-bottom:1px solid var(--line); white-space:nowrap; }
-th.n, td.n{ text-align:right; padding-right:0; }
+th.n, td.n{ text-align:right; padding-right:12px; }
 tbody tr:last-child td{ border-bottom:0; }
 .empty{ color:var(--mute); font-size:14px; padding:4px 0; }
 
