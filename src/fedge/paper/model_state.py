@@ -273,6 +273,15 @@ def market_probs(price_rows: pd.DataFrame, market: str) -> pd.DataFrame:
     return pd.DataFrame(p, index=w.index, columns=sels)
 
 
+def _model_columns(model_obj, learner: str) -> list[str] | None:
+    """Feature names the fitted model was trained with, in training order (None if unknown)."""
+    try:
+        names = model_obj.feature_name() if learner == "lgb" else model_obj.feature_names_
+    except (AttributeError, TypeError):
+        return None
+    return list(names) if names else None
+
+
 def score_fixtures(
     fits: dict, x_fix: pd.DataFrame, price_rows: pd.DataFrame, pool_weights: dict
 ) -> pd.DataFrame:
@@ -292,6 +301,10 @@ def score_fixtures(
             continue
         keys = p_market.index
         x = x_fix.reindex(keys)
+        # LightGBM Booster.predict takes a DataFrame positionally: use the training order.
+        cols = _model_columns(model_obj, learner)
+        if cols is not None:
+            x = x[cols]
         init = gbm.to_scores(p_market.to_numpy(dtype=float), market) if info["decor"] else None
         raw = gbm.predict_model(model_obj, learner, market, x, init)
         model_p = cal(raw)
