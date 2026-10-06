@@ -2,8 +2,8 @@
 
 CLV definition: log(price_taken * p_close_fair) = log(price_taken / fair_close_odds), where
 p_close_fair is the margin-free closing probability of the selection (see fedge.market). Taking
-exactly the fair closing price gives CLV = 0. Taking a raw (margined) closing price gives CLV of
-about +overround, which is not a price you can really get on both sides; do not read that as edge.
+exactly the fair closing price gives CLV = 0. The raw margined closing price is worse than fair:
+CLV = -log(booksum) < 0, the cost of the margin.
 For exchange prices pass commission-adjusted odds (see ``net_odds``).
 """
 
