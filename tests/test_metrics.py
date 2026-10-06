@@ -62,3 +62,19 @@ def test_plot_reliability(tmp_path):
     out = tmp_path / "r.png"
     M.plot_reliability([0.1, 0.5, 0.9, 0.9], [0, 1, 1, 1], out)
     assert out.exists() and out.stat().st_size > 0
+
+
+def test_calibration_slope_multi_is_the_pooled_one_vs_rest_slope():
+    rng = np.random.default_rng(3)
+    p = rng.dirichlet([3, 3, 3], 20000)
+    # calibrated multiclass forecasts: draw the outcome from the forecast itself
+    y = np.array([rng.choice(3, p=row) for row in p])
+    _, b = M.calibration_slope_multi(p, y)
+    assert b == pytest.approx(1.0, abs=0.1)
+    onehot = np.eye(3)[y]
+    flat_p, flat_y = p.ravel(), onehot.ravel()
+    a1, b1 = M.calibration_slope(flat_p, flat_y)
+    a2, b2 = M.calibration_slope_multi(p, y)
+    assert (a1, b1) == pytest.approx((a2, b2))
+    with pytest.raises(ValueError):
+        M.calibration_slope_multi(p, y[:10])

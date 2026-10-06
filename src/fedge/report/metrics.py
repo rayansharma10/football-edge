@@ -68,6 +68,22 @@ def calibration_slope(p, y, iters: int = 50) -> tuple[float, float]:
     return float(beta[0]), float(beta[1])
 
 
+def calibration_slope_multi(probs, y, iters: int = 50) -> tuple[float, float]:
+    """One-vs-rest pooled calibration slope for a multiclass forecast.
+
+    Every (class, match) pair contributes ``(p_k, 1[y = k])`` to a single logistic
+    recalibration ``y ~ sigmoid(a + b * logit(p))``; returns ``(a, b)``. Perfectly calibrated:
+    ``(0, 1)``; ``b < 1`` means overconfident.
+    """
+    p = np.asarray(probs, dtype=float)
+    y = np.asarray(y, dtype=int)
+    if p.ndim != 2 or len(p) != len(y):
+        raise ValueError("probs must be (n, k) and match len(y)")
+    flat_p = p.ravel()
+    flat_y = np.eye(p.shape[1], dtype=float)[y].ravel()
+    return calibration_slope(flat_p, flat_y, iters)
+
+
 def reliability_table(p, y, n_bins: int = 10) -> pd.DataFrame:
     """Equal-width reliability bins: mean forecast, observed frequency and count per bin."""
     p = np.asarray(p, dtype=float)
