@@ -1,0 +1,1 @@
+"""Bet selection strategy."""

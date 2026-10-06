@@ -1,5 +1,7 @@
 # football-edge ⚽
 
+[![CI](https://github.com/rayansharma10/football-edge/actions/workflows/ci.yml/badge.svg)](https://github.com/rayansharma10/football-edge/actions/workflows/ci.yml)
+
 A football (soccer) match-prediction and **paper-betting** system built as a proper ML pipeline: calibrated statistical/ML models, blended with the betting market, judged by **closing-line value (CLV)** against the Betfair Exchange.
 
 > **Status:** research complete, implementation not started. See the plan.

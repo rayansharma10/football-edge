@@ -1,0 +1,7 @@
+# Risk limits. LIVE must stay false until Gate 2 is signed off by Rayan.
+LIVE = false
+commission = 0.06        # Betfair AU, fraction of net market winnings
+max_stake_frac = 0.01    # max stake as fraction of bankroll
+kelly_fraction = 0.25
+max_bets_per_day = 20
+drawdown_kill = 0.2      # kill switch at 20% drawdown

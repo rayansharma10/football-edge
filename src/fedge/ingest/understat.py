@@ -1,0 +1,1 @@
+"""Understat xG ingest."""
