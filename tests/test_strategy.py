@@ -245,8 +245,14 @@ def test_render_strategy_toml_parses():
                     "whitelist": ["E0", "D1"],
                 }
             },
+            "shadow": {"shadow_threshold": 0.03},
         }
     )
     d = tomllib.loads(txt)
     assert d["gate0_passed"] is False and d["mode"] == "shadow"
     assert d["markets"]["1x2"]["whitelist"] == [["E0", "1x2"], ["D1", "1x2"]]
+    assert d["shadow"]["shadow_threshold"] == pytest.approx(0.03)
+    # a cfg with no [shadow] section stays valid (the desk then falls back to its own default)
+    assert "shadow" not in tomllib.loads(
+        S.render_strategy_toml({"comments": [], "top": {}, "markets": {}})
+    )

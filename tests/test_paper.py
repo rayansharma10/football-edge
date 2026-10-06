@@ -391,6 +391,58 @@ def test_gate0_mode_uses_the_per_market_threshold_and_the_whitelist():
     assert [b["mode"] for b in out] == ["paper"]
 
 
+def test_gate0_whitelist_accepts_the_rendered_pair_format(tmp_path):
+    """``render_strategy_toml`` writes ``[["E0", "1x2"], ...]``: pairs, not flat division codes."""
+    from fedge.backtest import strategy as S
+
+    txt = S.render_strategy_toml(
+        {
+            "comments": [],
+            "top": {"gate0_passed": True, "mode": "paper"},
+            "markets": {
+                "1x2": {"model": "lgbd_xg", "pool_weight": 0.46, "threshold": 0.06,
+                        "whitelist": ["E2", "D1"]},
+                "ou25": {"model": "lgb_xg", "pool_weight": 0.29, "threshold": 0.04,
+                         "whitelist": ["D1"]},
+            },
+            "shadow": {"shadow_threshold": 0.03},
+        }
+    )
+    path = tmp_path / "strategy.toml"
+    path.write_text(txt, encoding="utf-8")
+    cfg = picks.load_strategy(path)  # the loader the desk really uses
+    assert cfg["mode"] == "paper" and cfg["gate0_passed"] is True
+    assert picks.market_whitelist(cfg, "1x2", "paper") == ["E2", "D1"]
+    assert picks.market_whitelist(cfg, "ou25", "paper") == ["D1"]  # E2 only whitelists 1x2
+    assert picks.market_whitelist(cfg, "1x2", "shadow") == []  # shadow opens every division
+    assert picks.market_threshold(cfg, "ou25", "paper") == pytest.approx(0.04)
+
+    edges = _edges(
+        [
+            dict(match_key="k0", market="1x2", selection="H", price=4.0, price_source="BFE",
+                 model_prob=0.3, market_prob=0.25, pooled_prob=0.3, edge=0.07),
+            dict(match_key="k1", market="1x2", selection="H", price=4.0, price_source="BFE",
+                 model_prob=0.3, market_prob=0.25, pooled_prob=0.3, edge=0.07),
+        ]
+    )
+    f = _fixtures_frame(2)
+    f.loc[1, "div"] = "SC3"  # not whitelisted for 1x2
+    cand = picks.candidate_bets(edges, f, cfg, "paper")
+    assert list(cand["match_key"]) == ["k0"]
+
+
+def test_repo_strategy_toml_keeps_the_gate0_fields_and_adds_the_shadow_table():
+    """The committed config the desk reads: shadow bar explicit, Gate 0 fields untouched."""
+    text = (ROOT / "config" / "strategy.toml").read_text(encoding="utf-8")
+    assert "[shadow]" in text  # required by the P6 card: an explicit, reviewable shadow bar
+    cfg = picks.load_strategy(ROOT / "config" / "strategy.toml")
+    assert cfg["shadow_threshold"] == pytest.approx(0.03)
+    assert cfg["mode"] in ("paper", "shadow") and cfg["gate0_passed"] is (cfg["mode"] == "paper")
+    # shadow mode ignores the Gate 0 per-market bar and opens every division for both markets
+    assert picks.market_threshold(cfg, "1x2", "shadow") == pytest.approx(0.03)
+    assert picks.market_whitelist(cfg, "ou25", "shadow") == []
+
+
 def test_daily_cap_keeps_the_highest_edges_first():
     rows = [
         dict(match_key=f"k{i}", market="1x2", selection="H", price=4.0, price_source="BFE",

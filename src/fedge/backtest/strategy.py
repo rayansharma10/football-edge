@@ -37,6 +37,8 @@ SELECTIONS = {"1x2": ("H", "D", "A"), "ou25": ("over", "under")}
 THRESHOLDS = (0.0, 0.02, 0.04, 0.06, 0.08)  # minimum edge (EV per unit stake after commission)
 KELLY_FRACTIONS = (0.1, 0.25)
 MIN_HIST_BETS = 100  # history bets needed before a threshold can win the in-fold search
+# Phase 6 desk edge bar while Gate 0 has not passed (written to config/strategy.toml as [shadow]).
+SHADOW_THRESHOLD = 0.03
 MIN_CELL_BETS = 25  # history bets needed before a div can enter the whitelist
 DD_CAP = 0.20  # drawdown cap used when choosing the Kelly fraction (limits.toml drawdown_kill)
 MIN_HIST_SEASONS = 2  # seasons of prior ledger required before the strategy bets at all
@@ -471,4 +473,9 @@ def render_strategy_toml(cfg: dict) -> str:
                 lines.append(f"whitelist = [{items}]")
             else:
                 lines.append(f"{k} = {lit(v)}")
+    shadow = cfg.get("shadow")
+    if shadow:
+        lines += ["", "[shadow]"]
+        for k, v in shadow.items():
+            lines.append(f"{k} = {lit(v)}")
     return "\n".join(lines) + "\n"

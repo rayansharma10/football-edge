@@ -69,10 +69,24 @@ def market_threshold(strategy: dict, market: str, mode: str) -> float:
 
 
 def market_whitelist(strategy: dict, market: str, mode: str) -> list[str]:
-    """Divisions allowed for ``market``: every division in shadow mode, else the Gate 0 list."""
+    """Divisions allowed for ``market``: every division in shadow mode, else the Gate 0 list.
+
+    ``config/strategy.toml`` stores the whitelist as ``[["E0", "1x2"], ...]`` (division, market)
+    pairs, one per whitelisted cell, as written by ``run_strategy.render_strategy_toml``; a flat
+    list of division codes is accepted too. Pairs belonging to another market are ignored, and the
+    division codes are returned flat so they can be matched against a fixture's ``div``.
+    """
     if mode == "shadow":
         return []
-    return list(strategy["markets"][market].get("whitelist", []))
+    out: list[str] = []
+    for item in strategy["markets"][market].get("whitelist", []):
+        if isinstance(item, (list, tuple)):
+            if len(item) < 2 or str(item[1]) != market:
+                continue
+            out.append(str(item[0]))
+        else:
+            out.append(str(item))
+    return out
 
 
 def candidate_bets(
