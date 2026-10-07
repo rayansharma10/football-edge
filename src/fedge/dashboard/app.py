@@ -22,6 +22,9 @@ STATIC = Path(__file__).with_name("static")
 
 # A job is "stale" when its last success is older than this many hours.
 STALE_HOURS = {"picks": 14.0, "settle": 30.0}
+# Betting is parked (accuracy-tracker pivot): these cron jobs are paused on purpose, so they are
+# labelled "parked" and never count towards the stale alarm.
+PARKED_JOBS = frozenset({"picks", "settle"})
 
 
 def _connect_ro(db: Path) -> sqlite3.Connection | None:
@@ -38,8 +41,10 @@ def _rows(conn: sqlite3.Connection | None, sql: str, args: tuple = ()) -> list[d
         return []
     try:
         return [dict(r) for r in conn.execute(sql, args).fetchall()]
-    except sqlite3.OperationalError:  # table missing (ledger never initialised)
-        return []
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():  # ledger never initialised
+            return []
+        raise  # SQLITE_BUSY / corruption must surface, not look like an empty ledger
 
 
 def _scalar(conn: sqlite3.Connection | None, sql: str):
@@ -102,7 +107,8 @@ def create_app(root: Path | str = ROOT) -> FastAPI:
                 "last_attempt_utc": s.get("last_attempt_utc"),
                 "age_hours": None if age is None else round(age, 1),
                 "stale_after_hours": limit,
-                "stale": age is None or age > limit,
+                "parked": job in PARKED_JOBS,
+                "stale": job not in PARKED_JOBS and (age is None or age > limit),
             }
         return out
 

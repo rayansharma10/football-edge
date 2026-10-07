@@ -24,7 +24,10 @@ def test_empty_no_db(tmp_path):
     c = TestClient(create_app(_root(tmp_path)))
     s = c.get("/api/summary").json()
     assert s["ledger_exists"] is False and s["gate0_passed"] is False and s["mode"] == "shadow"
-    assert s["counts"]["bets"] == 0 and s["any_stale"] is True and s["latest_report"] is None
+    assert s["counts"]["bets"] == 0 and s["latest_report"] is None
+    # betting jobs are parked: labelled as such, never "stale" (the alarm was permanently red)
+    assert s["any_stale"] is False
+    assert all(j["parked"] and not j["stale"] for j in s["jobs"].values())
     for p in ("open_bets", "settled", "snapshots"):
         assert c.get(f"/api/{p}").json() == {"rows": []}
     assert c.get("/api/series").json() == {"points": []}

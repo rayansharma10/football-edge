@@ -4,7 +4,7 @@
 # affect the Gate 0 verdict or the in-fold selection above.
 gate0_passed = false
 mode = "shadow"
-price_source = "BFE pre-closing, else PS pre-closing (pre 2025-07-23); never Max/Avg"
+price_source = "BFE pre-closing, else PS pre-closing (pre 2025-07-23); never Max. Live desk: BFE pre-closing, else Avg (never Max)"
 commission = 0.06
 kelly_fraction = 0.1
 bet_time = "kickoff-24h snapshot (ASSUMED, see reports/gate0.md)"

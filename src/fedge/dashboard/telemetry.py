@@ -47,8 +47,10 @@ def _rows(conn, sql: str, args: tuple = ()) -> list[dict]:
         return []
     try:
         return [dict(r) for r in conn.execute(sql, args).fetchall()]
-    except sqlite3.OperationalError:  # table missing: the scripts have not run yet
-        return []
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():  # the scripts have not run yet
+            return []
+        raise  # SQLITE_BUSY / corruption must surface, not look like "no predictions"
 
 
 def register(app: FastAPI, root: Path) -> None:

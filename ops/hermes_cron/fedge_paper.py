@@ -4,6 +4,7 @@ Records each run in <repo>/data/last_run.json (read by the dashboard) and provid
 catch-up mode: the PC is often off at the scheduled time, so a frequent cheap job calls
 main("catchup"), which runs picks/settle once if their last success is too old.
 """
+import contextlib
 import json
 import os
 import pathlib
@@ -33,15 +34,51 @@ def _load_state() -> dict:
         return {}
 
 
+LOCK_STALE_S = 60.0
+
+
+@contextlib.contextmanager
+def _state_lock(timeout: float = 30.0):
+    """Cross-process lock (O_EXCL lockfile) so overlapping predict/results crons cannot lose an update."""
+    lock = STATE.with_name(STATE.name + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    t0 = time.monotonic()
+    while True:
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            break
+        except FileExistsError:
+            try:  # break a lock left behind by a crashed process
+                if time.time() - lock.stat().st_mtime > LOCK_STALE_S:
+                    lock.unlink()
+                    continue
+            except FileNotFoundError:
+                continue
+            if time.monotonic() - t0 > timeout:
+                raise TimeoutError(f"could not lock {lock}")
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        try:
+            lock.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _record(job: str, ok: bool) -> None:
-    st = _load_state()
-    e = st.setdefault(job, {})
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    e["last_attempt_utc"] = now
-    if ok:
-        e["last_success_utc"] = now
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    STATE.write_text(json.dumps(st, indent=2), encoding="utf-8")
+    with _state_lock():
+        st = _load_state()  # re-read inside the lock: read-modify-write must be atomic
+        e = st.setdefault(job, {})
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        e["last_attempt_utc"] = now
+        if ok:
+            e["last_success_utc"] = now
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATE.with_name(f"{STATE.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(st, indent=2), encoding="utf-8")
+        os.replace(tmp, STATE)  # atomic: a dashboard read never sees a half-written file
 
 
 def catchup() -> int:
@@ -66,11 +103,18 @@ def _run(job: str):
     env = {k: v for k, v in os.environ.items()
            if k.upper() not in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "PYTHONSTARTUP")}
     env["PYTHONUTF8"] = "1"
-    return subprocess.run(
-        [UV, "run", "python", str(script)],
-        env=env, cwd=REPO, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=1500,
-    )
+    try:
+        return subprocess.run(
+            [UV, "run", "python", str(script)],
+            env=env, cwd=REPO, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=1500,
+        )
+    except subprocess.TimeoutExpired as exc:  # a hung job must still be recorded as a failure
+        out = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        err = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return subprocess.CompletedProcess(
+            exc.cmd, 124, stdout=out, stderr=err + f"\ntimed out after {exc.timeout:.0f}s"
+        )
 
 
 def main(job: str) -> int:
@@ -79,7 +123,7 @@ def main(job: str) -> int:
     p = _run(job)
     if p is None:
         return 0  # desk script missing: stay quiet
-    if p.returncode != 0:
+    if p.returncode != 0 and p.returncode != 124:
         time.sleep(20)  # one retry: a venv mid-sync gives a transient ImportError
         p = _run(job)
     if p.stdout.strip():

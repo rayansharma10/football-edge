@@ -41,6 +41,17 @@ def conn(tmp_path):
     c.close()
 
 
+def test_connect_uses_wal_and_dashboard_rows_only_swallow_missing_tables(conn, tmp_path):
+    from fedge.dashboard import app as dash_app
+    from fedge.dashboard import telemetry
+
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    for rows in (telemetry._rows, dash_app._rows):
+        assert rows(conn, "SELECT * FROM no_such_table") == []  # not initialised yet
+        with pytest.raises(sqlite3.OperationalError):
+            rows(conn, "SELECT FROM WHERE")  # any other failure must surface
+
+
 def _kinds(conn, key="m1"):
     return conn.execute(
         "SELECT snapshot_kind, run_ts, hours_before_kickoff FROM prediction_log "
@@ -275,12 +286,34 @@ def test_build_results_schedule_primary_with_football_data_fallback_and_crossche
         "div": ["E0", "E0"], "home": ["Arsenal", "Hull"], "away": ["Coventry", "Man United"],
         "kickoff_utc": [k, k + pd.Timedelta(days=1)], "FTHG": [2, 2], "FTAG": [0, 0],
     })
-    rows, warns = res_mod.build_results(sched, {"E0": "fixturedownload"}, fd, ["E0"], k)
+    rows, warns = res_mod.build_results(
+        sched, {"E0": "fixturedownload"}, fd, ["E0"], k + pd.Timedelta(days=5))
     by = {r["home"]: r for r in rows}
-    assert by["Arsenal"]["home_goals"] == 3 and by["Arsenal"]["source"] == "fixturedownload"
+    # conflict: the football-data value (2-0) wins over the schedule's 3-0
+    assert by["Arsenal"]["home_goals"] == 2 and by["Arsenal"]["source"] == "football_data"
     assert by["Hull"]["source"] == "football_data" and by["Hull"]["result"] == "H"
     assert "Leeds" not in by  # not finished anywhere
     assert any("mismatch" in w for w in warns)  # 3-0 vs 2-0 is reported, schedule kept
+
+
+def test_build_results_ignores_in_play_schedule_score_but_accepts_after_3h():
+    k = pd.Timestamp("2026-08-21T19:00Z")
+    sched = pd.DataFrame({
+        "div": ["E0"], "home": ["Arsenal"], "away": ["Coventry"], "kickoff_utc": [k],
+        "round": [1], "played": [True], "home_goals": [1.0], "away_goals": [0.0],
+    })
+    src = {"E0": "fixturedownload"}
+    live, warns = res_mod.build_results(sched, src, None, ["E0"], k + pd.Timedelta(minutes=30))
+    assert live == [] and any("in-play" in w for w in warns)
+    short, _ = res_mod.build_results(sched, src, None, ["E0"], k + pd.Timedelta(minutes=179))
+    assert short == []
+    done, _ = res_mod.build_results(sched, src, None, ["E0"], k + pd.Timedelta(hours=3))
+    assert [(r["home_goals"], r["source"]) for r in done] == [(1, "fixturedownload")]
+    # a football-data twin is final by definition: used even while the schedule looks in-play
+    fd = pd.DataFrame({"div": ["E0"], "home": ["Arsenal"], "away": ["Coventry"],
+                       "kickoff_utc": [k], "FTHG": [2], "FTAG": [0]})
+    rows, _ = res_mod.build_results(sched, src, fd, ["E0"], k + pd.Timedelta(minutes=30))
+    assert [(r["home_goals"], r["source"]) for r in rows] == [(2, "football_data")]
 
 
 # ------------------------------------------------------------------ report

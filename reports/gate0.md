@@ -604,7 +604,7 @@ Slope = pooled one-vs-rest calibration slope; ECE on the pooled one-vs-rest prob
 
 ## 9. Gate 0 checklist (M3 section 5)
 
-Status: PASS / FAIL / PARTIAL (PARTIAL = part of the acceptance test cannot be demonstrated on historical data). Gate 0 passes only if every item is PASS **and** the headline net CLV CI excludes 0 (this card's additional bar).
+Status: PASS / FAIL / PARTIAL (PARTIAL = part of the acceptance test cannot be demonstrated on historical data). Gate 0 is decided on the computable items only: it passes if every non-PARTIAL item is PASS **and** the headline net CLV CI excludes 0 (this card's additional bar). PARTIAL items are not graded here; they are listed below as explicit **Gate 1 prerequisites** and must be closed on live data before Gate 1. B0.2, B0.5 and B0.10 are computed from the run's data, not asserted (rule changed after this report was generated; the grades below were not re-run, and a regeneration is expected to leave them unchanged).
 
 | # | Requirement | Status | Evidence |
 |---|---|---|---|
@@ -620,6 +620,8 @@ Status: PASS / FAIL / PARTIAL (PARTIAL = part of the acceptance test cannot be d
 | B0.10 | Honest reporting of failures | **PASS** | losing runs reported with CIs: every scenario, the no-whitelist variant, and per-cell results below (including negative cells); nothing was dropped |
 
 Headline strategy: n=0, net CLV - [-, -], flat ROI -. **Gate 0: NOT PASSED.**
+
+**Gate 1 prerequisites (PARTIAL items, not gradable on history):** B0.8 (Execution modelled), B0.9 (Parameters chosen in-fold).
 
 ## 10. Caveats and unverified assumptions
 
@@ -643,7 +645,7 @@ Gate 0 did **not** pass, so `config/strategy.toml` has `gate0_passed = false` an
 # affect the Gate 0 verdict or the in-fold selection above.
 gate0_passed = false
 mode = "shadow"
-price_source = "BFE pre-closing, else PS pre-closing (pre 2025-07-23); never Max/Avg"
+price_source = "BFE pre-closing, else PS pre-closing (pre 2025-07-23); never Max. Live desk: BFE pre-closing, else Avg (never Max)"
 commission = 0.06
 kelly_fraction = 0.1
 bet_time = "kickoff-24h snapshot (ASSUMED, see reports/gate0.md)"

@@ -14,8 +14,10 @@ Two files, both refreshed roughly Friday and Tuesday afternoon UK time:
     training universe, so they are counted and reported but cannot be scored.
 
 Price sources used here, in priority order: **BFE** (Betfair Exchange), then ``Avg`` (market
-average), then ``Max`` (best of market). Pinnacle (``PP``) is deliberately excluded: it is stale
-from 2025-07-23 (AGENTS.md rule 9). A source only qualifies for a fixture when *every* selection of
+average). ``Max`` (best of market) is deliberately not a fallback: Gate 0 found data errors in Max
+quotes and the 1.10x bad-quote guard exists only in the backtest. Pinnacle (``PP``) is
+deliberately excluded: it is stale from 2025-07-23 (AGENTS.md rule 9). A source only qualifies for
+a fixture when *every* selection of
 that market is quoted, because the de-vig needs the complete book.
 
 The kickoff is ``Date`` + ``Time`` interpreted as Europe/London and converted to UTC by
@@ -39,7 +41,7 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0 Safari/537.36"
 )
-SOURCES = ("BFE", "Avg", "Max")  # priority order; Pinnacle excluded (stale)
+SOURCES = ("BFE", "Avg")  # priority order; Pinnacle (stale) and Max (bad quotes) excluded
 
 _COLS: dict[str, dict[str, dict[str, str]]] = {
     "BFE": {

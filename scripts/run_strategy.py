@@ -303,6 +303,57 @@ def summary_text(out: dict, res: dict) -> str:
     return " ".join(txt)
 
 
+def gate0_decision(gates: dict, clv_pos: bool) -> tuple[bool, list[str]]:
+    """``(passed, gate1_prereqs)``: gate on the computable items, list PARTIAL ones separately.
+
+    PARTIAL = "not demonstrable on football-data history" (e.g. order-book depth). Such items
+    cannot be graded by this run, so they neither pass nor fail Gate 0; they are returned as
+    explicit Gate 1 prerequisites. Gate 0 passes iff every other item is PASS and the headline
+    net CLV CI excludes 0.
+    """
+    prereqs = [k for k, v in gates.items() if v[0] == "PARTIAL"]
+    gated = [v[0] for k, v in gates.items() if k not in prereqs]
+    return bool(all(s == "PASS" for s in gated) and clv_pos), prereqs
+
+
+def walkforward_ok(res: dict) -> bool:
+    """B0.2 from data: every scored fold season has >= MIN_HIST_SEASONS earlier seasons."""
+    for r in res.values():
+        seasons = sorted(r["seasons"])
+        allowed = set(seasons[S.MIN_HIST_SEASONS :])
+        used = set(r["bets"]["season"]) if len(r["bets"]) else set()
+        used |= set(r["cfgs"]["season"]) if len(r["cfgs"]) else set()
+        if not used <= allowed:
+            return False
+    return True
+
+
+def benchmark_ok(bench: pd.DataFrame) -> bool:
+    """B0.5 from data: every market has finite metrics for the close, pre-close and a model."""
+    cols = ["rps", "log_loss", "brier", "slope", "ece"]
+    if not len(bench):
+        return False
+    for market in ("1x2", "ou25"):
+        b = bench[bench["market"] == market]
+        if not {"market_close", "market_pre", "lgb_xg"} <= set(b["model"]):
+            return False
+        if not np.isfinite(b[cols].to_numpy(float)).all():
+            return False
+    return True
+
+
+def reporting_ok(out: dict, scenarios=SCENARIOS) -> bool:
+    """B0.10 from data: every scenario reported, and its per-cell table accounts for every bet."""
+    for s in scenarios:
+        o = out.get(s)
+        if not o or "overall" not in o:
+            return False
+        n_cells = int(o["by_cell"]["n"].sum()) if len(o["by_cell"]) else 0
+        if n_cells != int(o["overall"].get("n", 0)):
+            return False
+    return True
+
+
 def run_pytest_counts() -> str:
     files = ["tests/test_leakage.py", "tests/test_stats_walkforward.py", "tests/test_strategy.py"]
     r = subprocess.run(
@@ -498,7 +549,7 @@ def final_config(data: dict, res: dict, gate_pass: bool) -> tuple[dict, pd.DataF
     top = {
         "gate0_passed": bool(gate_pass),
         "mode": "paper" if gate_pass else "shadow",
-        "price_source": "BFE pre-closing, else PS pre-closing (pre 2025-07-23); never Max/Avg",
+        "price_source": "BFE pre-closing, else PS pre-closing (pre 2025-07-23); never Max. Live desk: BFE pre-closing, else Avg (never Max)",
         "commission": COMMISSION,
         "kelly_fraction": float(kelly),
         "bet_time": "kickoff-24h snapshot (ASSUMED, see reports/gate0.md)",
@@ -626,7 +677,7 @@ def main() -> None:  # pragma: no cover - CLI driver
             f"max |A/E-1| = {sizing:.3f} over pre/close x selection on the evaluation rows (<0.03 required); full per-league report reports/devig_sanity.md",
         ),
         "B0.2": (
-            "PASS",
+            "PASS" if walkforward_ok(res) and "passed" in pytest_txt else "FAIL",
             "season-expanding folds only (`fedge.backtest.walkforward`, tests/test_stats_walkforward.py); this card's pool weight, model, threshold, whitelist, Kelly fraction use seasons < test season; no random split anywhere",
         ),
         "B0.3": (
@@ -642,7 +693,7 @@ def main() -> None:  # pragma: no cover - CLI driver
             + (" (identical)" if deterministic else " (DIFFERENT)"),
         ),
         "B0.5": (
-            "PASS",
+            "PASS" if benchmark_ok(bench) else "FAIL",
             "per-season RPS / log loss / Brier / slope / ECE for the pooled model, lgb_xg and the de-margined market close and pre-close: section 6 and reports/v2_main_metrics_by_league_season.csv. The model does NOT beat the close (see table)",
         ),
         "B0.6": (
@@ -673,11 +724,11 @@ def main() -> None:  # pragma: no cover - CLI driver
             + "). Only the whitelist can return a no-bet fold. Documented in section 1 and pinned by tests/test_strategy.py::test_select_market_config_has_no_positivity_floor rather than 'fixed', because a hist_clv > 0 floor would empty the exch ledger in every fold and hide the configuration.",
         ),
         "B0.10": (
-            "PASS",
+            "PASS" if reporting_ok(out) else "FAIL",
             "losing runs reported with CIs: every scenario, the no-whitelist variant, and per-cell results below (including negative cells); nothing was dropped",
         ),
     }
-    gate_pass = all(v[0] == "PASS" for v in gates.values()) and clv_pos
+    gate_pass, _gate1_prereqs = gate0_decision(gates, clv_pos)
     cfg, cfg_rows = final_config(data, res[HEADLINE], gate_pass)
     (CONFIG / "strategy.toml").write_text(
         S.render_strategy_toml(cfg), encoding="utf-8", newline="\n"
@@ -1076,7 +1127,7 @@ def write_report(
     L += [
         "## 9. Gate 0 checklist (M3 section 5)",
         "",
-        "Status: PASS / FAIL / PARTIAL (PARTIAL = part of the acceptance test cannot be demonstrated on historical data). Gate 0 passes only if every item is PASS **and** the headline net CLV CI excludes 0 (this card's additional bar).",
+        "Status: PASS / FAIL / PARTIAL (PARTIAL = part of the acceptance test cannot be demonstrated on historical data). Gate 0 is decided on the computable items only: it passes if every non-PARTIAL item is PASS **and** the headline net CLV CI excludes 0 (this card's additional bar). PARTIAL items are not graded here; they are listed below as explicit **Gate 1 prerequisites** and must be closed on live data before Gate 1. B0.2, B0.5 and B0.10 are computed from the run's data, not asserted.",
         "",
         "| # | Requirement | Status | Evidence |",
         "|---|---|---|---|",
@@ -1099,6 +1150,13 @@ def write_report(
     L += [
         "",
         f"Headline strategy: n={ov.get('n', 0)}, net CLV {f(ov.get('clv_net'), 4, True)} [{f(ov.get('clv_net_lo'), 4, True)}, {f(ov.get('clv_net_hi'), 4, True)}], flat ROI {f(ov.get('roi_flat'), 2, True)}. **Gate 0: {'PASS' if gate_pass else 'NOT PASSED'}.**",
+        "",
+        "**Gate 1 prerequisites (PARTIAL items, not gradable on history):** "
+        + (
+            ", ".join(f"{k} ({names[k]})" for k in gates if gates[k][0] == "PARTIAL")
+            or "none"
+        )
+        + ".",
         "",
     ]
 

@@ -15,6 +15,7 @@ from fedge.accuracy.store import iso, outcome_of
 from fedge.ingest import schedule as sch
 
 PAIR_TOLERANCE = pd.Timedelta(days=3)
+FINISHED_AFTER = pd.Timedelta(hours=3)  # kickoff + this = a schedule score is final
 
 
 def _row(key, div, home, away, kickoff, hg, ag, source, fetched) -> dict:
@@ -37,6 +38,9 @@ def build_results(
     """
     warnings: list[str] = []
     rows: list[dict] = []
+    fetched_ts = pd.Timestamp(fetched)
+    fetched_ts = (fetched_ts.tz_localize("UTC") if fetched_ts.tzinfo is None
+                  else fetched_ts.tz_convert("UTC"))
     divs = set(map(str, divs))
     fd = pd.DataFrame()
     if played is not None and len(played):
@@ -59,7 +63,14 @@ def build_results(
                 twin = m.iloc[0]
                 used_fd.add(int(m.index[0]))
         has_sched = pd.notna(s["home_goals"]) and pd.notna(s["away_goals"])
-        if has_sched:
+        # a schedule feed may publish in-play scores: only trust one once the match must be over
+        finished = f["kickoff_utc"] + FINISHED_AFTER <= fetched_ts
+        if has_sched and not finished:
+            warnings.append(
+                f"schedule score for {f['home']} v {f['away']} ignored: kickoff "
+                f"{f['kickoff_utc']:%Y-%m-%d %H:%M}Z + 3h is after fetch time (possible in-play)"
+            )
+        if has_sched and finished:
             src = str(sources.get(f["div"], "schedule")).replace("cache:", "")
             if twin is not None and (int(twin["FTHG"]), int(twin["FTAG"])) != (
                 int(s["home_goals"]), int(s["away_goals"])
@@ -67,10 +78,14 @@ def build_results(
                 warnings.append(
                     f"score mismatch {f['home']} v {f['away']}: {src} "
                     f"{int(s['home_goals'])}-{int(s['away_goals'])} vs football-data "
-                    f"{int(twin['FTHG'])}-{int(twin['FTAG'])} (kept {src})"
+                    f"{int(twin['FTHG'])}-{int(twin['FTAG'])} (kept football-data)"
                 )
-            rows.append(_row(f["match_key"], f["div"], f["home"], f["away"], f["kickoff_utc"],
-                             s["home_goals"], s["away_goals"], src, fetched))
+                rows.append(_row(f["match_key"], f["div"], f["home"], f["away"],
+                                 f["kickoff_utc"], twin["FTHG"], twin["FTAG"],
+                                 "football_data", fetched))
+            else:
+                rows.append(_row(f["match_key"], f["div"], f["home"], f["away"],
+                                 f["kickoff_utc"], s["home_goals"], s["away_goals"], src, fetched))
         elif twin is not None:
             rows.append(_row(f["match_key"], f["div"], f["home"], f["away"], f["kickoff_utc"],
                              twin["FTHG"], twin["FTAG"], "football_data", fetched))

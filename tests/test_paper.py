@@ -342,7 +342,7 @@ def test_fixture_parse_converts_uk_local_time_and_builds_the_ingest_match_key(tm
     assert rows[rows["selection"] == "H"]["price"].iloc[0] == 4.0
 
 
-def test_price_source_priority_bfe_then_avg_then_max(tmp_path):
+def test_price_source_priority_bfe_then_avg_never_max(tmp_path):
     def row(i, **odds):
         return {"Div": "E2", "Date": "01/11/2027", "Time": "15:00", "HomeTeam": f"H{i}",
                 "AwayTeam": f"A{i}", **odds}
@@ -352,15 +352,16 @@ def test_price_source_priority_bfe_then_avg_then_max(tmp_path):
         [
             row(0, BFEH=4.0, BFED=3.9, BFEA=2.0),          # BFE complete
             row(1, AvgH=4.1, AvgD=3.9, AvgA=2.0),          # only Avg complete
-            row(2, MaxH=4.2, MaxD=3.9, MaxA=2.0),          # only Max complete
+            row(2, MaxH=4.2, MaxD=3.9, MaxA=2.0),          # only Max complete: never used
             row(3, BFEH=4.0, BFED=3.9, AvgH=4.1, AvgD=3.9, AvgA=2.0),  # BFE incomplete
         ],
     )
     raw = fx.read_fixture_csv(p)
     fix = fx.parse_fixtures(raw)
     rows = fx.market_rows(raw, fix, phase="pre", markets=("1x2",))
-    got = [rows[rows["match_key"] == k]["price_source"].iloc[0] for k in fix["match_key"]]
-    assert got == ["BFE", "Avg", "Max", "Avg"]  # incomplete BFE falls back to the complete Avg book
+    got = [rows.loc[rows["match_key"] == k, "price_source"].tolist() for k in fix["match_key"]]
+    # incomplete BFE falls back to the complete Avg book; a Max-only fixture gets no price
+    assert got == [["BFE"] * 3, ["Avg"] * 3, [], ["Avg"] * 3]
 
 
 def test_price_column_names_for_the_closing_phase():
@@ -597,6 +598,45 @@ def test_picks_prints_the_digest_only_when_it_places_new_bets(pick_env, capsys):
     assert out2 == ""
     assert len(ledger.read_table(conn, "bets")) == 1
     assert len(ledger.read_table(conn, "snapshots")) == 5
+    conn.close()
+
+
+def test_picks_reads_a_fresh_clock_after_scoring(pick_env, monkeypatch, capsys):
+    """M1: the kickoff re-check and created_utc use the time after score_all, not script start."""
+    mod, argv, data = pick_env
+    start = pd.Timestamp.now(tz="UTC")
+    clock = {"now": start}
+    monkeypatch.setattr(mod, "_utc_now", lambda: clock["now"])
+
+    def slow_score(*a, **k):
+        clock["now"] = start + pd.Timedelta(hours=1)  # the fit "took an hour"
+        return _fake_score_all(*a, **k)
+
+    monkeypatch.setattr(mod.model_state, "score_all", slow_score)
+    assert mod.main(argv) == 0
+    conn = ledger.connect(ledger.default_path(data))
+    bets = ledger.read_table(conn, "bets")
+    snaps = ledger.read_table(conn, "snapshots")
+    assert len(bets) == 1
+    assert bets.loc[0, "created_utc"] == picks._iso(start + pd.Timedelta(hours=1))
+    assert set(snaps["seen_utc"]) == {picks._iso(start + pd.Timedelta(hours=1))}
+    conn.close()
+
+
+def test_picks_rejects_a_fixture_that_kicked_off_while_scoring(pick_env, monkeypatch, capsys):
+    mod, argv, data = pick_env
+    start = pd.Timestamp.now(tz="UTC")
+    clock = {"now": start}
+    monkeypatch.setattr(mod, "_utc_now", lambda: clock["now"])
+
+    def slow_score(*a, **k):
+        clock["now"] = start + pd.Timedelta(days=45)  # fixtures are ~30 days out: kicked off
+        return _fake_score_all(*a, **k)
+
+    monkeypatch.setattr(mod.model_state, "score_all", slow_score)
+    assert mod.main(argv) == 0
+    conn = ledger.connect(ledger.default_path(data))
+    assert len(ledger.read_table(conn, "bets")) == 0
     conn.close()
 
 

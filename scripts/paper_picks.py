@@ -97,9 +97,14 @@ def _refresh_predictions(args, edges, fixtures, played, now) -> None:
               file=sys.stderr)
 
 
+def _utc_now() -> pd.Timestamp:
+    """Wall clock; a module function so tests can advance time between pipeline stages."""
+    return pd.Timestamp.now(tz="UTC")
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
-    now = pd.Timestamp.now(tz="UTC")
+    now = _utc_now()
 
     strategy = picks.load_strategy(args.config)
     limits = risk.effective_limits(risk.load_limits(args.limits), strategy)
@@ -166,10 +171,13 @@ def main(argv=None) -> int:
     cfg_hash = picks.file_hash(args.config)
     gate_hash = picks.gate0_hash(args.gates)
     experiment = f"{strategy['mode']}-{cfg_hash[:8]}"
-    snapshots = picks.snapshot_rows(edges, scored, now)
+    # model fits can take minutes: re-read the clock so the kickoff re-check in plan_bets, the
+    # bets' created_utc and the snapshots' seen_utc reflect planning time, not script start
+    t_plan = _utc_now()
+    snapshots = picks.snapshot_rows(edges, scored, t_plan)
     remaining = 0 if state["blocked"] else state["remaining"]
     bets = picks.plan_bets(
-        edges, scored, strategy, limits, remaining, now, cfg_hash, gate_hash, experiment
+        edges, scored, strategy, limits, remaining, t_plan, cfg_hash, gate_hash, experiment
     )
 
     if args.dry_run:

@@ -124,7 +124,7 @@ async function refresh() {
         [`Market ${esc(k)}`, `${esc(m.model)} ${m.qualified ? '<span class="good">qualified</span>' : '<span class="mute">not qualified</span>'}`]),
     ]);
     $("jobs").innerHTML = kv(Object.entries(s.jobs || {}).flatMap(([name, jb]) => [
-      [`${name} last success`, `${stamped(jb.last_success_utc)} ${jb.age_hours != null ? `(${jb.age_hours}h ago)` : ""} ${jb.stale ? '<span class="bad">STALE</span>' : '<span class="good">ok</span>'}`],
+      [`${name} last success`, `${stamped(jb.last_success_utc)} ${jb.age_hours != null ? `(${jb.age_hours}h ago)` : ""} ${jb.parked ? '<span class="mute">parked</span>' : jb.stale ? '<span class="bad">STALE</span>' : '<span class="good">ok</span>'}`],
       [`${name} last attempt`, stamped(jb.last_attempt_utc)],
     ]));
     $("counts").innerHTML = kv([

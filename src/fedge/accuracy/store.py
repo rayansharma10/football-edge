@@ -128,6 +128,9 @@ def connect(path: Path | str) -> sqlite3.Connection:
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(p, timeout=30)
     conn.row_factory = sqlite3.Row
+    # WAL: a dashboard read must not collide with replace_upcoming's DELETE+INSERT commit
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
     conn.executescript(SCHEMA)
     return conn
 
